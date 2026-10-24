@@ -135,24 +135,54 @@ a porting fault: `root.apfs` is the 4 MB image that belongs on `/redwood`, and i
 only when no system image is resident. `xl ramdisk userland/system.apfs` (2.5 GB, 26 MB/s over this
 cable) is what makes the big image the root.
 
-**`bootcpu=7` is not optional.** The first attempt with the resident image passed `cpus=8` without
-it. The kernel then started on the core the firmware hands over — which is the core the loader
-watches from — took every core, and the phone hung with nothing on the wire: `fastboot devices`
-printed `????????????` and every `getvar` timed out. No watchdog was armed (see below), so it had to
-be power-cycled by hand. `wdt_arm()` used to return early for anything that was not redwood; it now
-returns early only for `platform_qemu_virt`, so a hang on any real phone resets itself after 30 s.
+**SpringBoard runs, and the screen is the iOS home screen.** With the system image resident and
+`bootcpu=7`:
+
+    ./xl ramdisk userland/system.apfs          # 2376 MB, 26 MB/s over USB, 89 s
+    XL_SECS=120 XL_CMDLINE="bootcpu=7" ./xl run
+
+launchd comes up, spawns the real daemons, and SpringBoard draws. A screenshot taken through the
+loader shows the iOS 16.5 home screen: status bar with the clock and battery, the Weather and
+Calendar widgets, the app grid, and the dock. `ps` at the end of the run lists SpringBoard,
+backboardd, logd, usermanagerd, fseventsd and containermanagerd.
+
+**`bootcpu=7` is what keeps the phone alive.** The first attempt with the resident image passed
+`cpus=8` without it. The kernel then started on the core the firmware hands over — which is the core
+the loader watches from — took every core, and the phone hung with nothing on the wire:
+`fastboot devices` printed `????????????` and every `getvar` timed out. No watchdog was armed (see
+below), so it had to be power-cycled by hand. `cpus=1` without `bootcpu=7` hung the same way, so the
+fault was never the core count: it is that the loader must not be left without a core. `bootcpu=7`
+with `cpus` left at its default gives it one, and every run since has returned cleanly (`returned
+462892 0`).
+
+`wdt_arm()` used to return early for anything that was not redwood; it now returns early only for
+`platform_qemu_virt`. That is right, but it does not help umi yet: every SMC returns
+`0xffffffffffffffff`, i.e. this firmware does not implement Qualcomm's Haven virtual watchdog
+(`VIRT_WDT_* 0x86000005..0008`), so `wdt_armed` ends up 0 either way. On this phone a hung kernel is
+a phone that needs the power button — which is why `bootcpu=7` matters more here than it does on
+redwood, where the same watchdog would have caught the hang.
 
 ## Not done yet
 
-- **SpringBoard.** The kernel reaches `load_init_program`; getting past it needs the resident system
-  image and, after that, whatever the boot log says next. Nothing beyond `launchd` has been run.
+- **Touch, buttons, battery, GPU.** The kernel's device code is still redwood's. The log names the
+  gaps plainly: `redwood: battery: SOC=-1% battery=0` (PMIC not driven), `redwood: input: the event
+  server asks for property "..." which we do not have` (the HID service is incomplete and there is
+  no touch driver at all, so the home screen cannot be poked), `redwood: SpringBoard: no GPU draws,
+  vibrant views are plain` (software rendering). The Weather and Calendar widgets are blank for the
+  same reason plus no network.
 - **No touch driver.** umi is an ST Focaltech part on GENI I2C SE13 (`3-0049`); the kernel in this
   tree has redwood's Goodix GT9916 over bit-banged SPI. `BOOTARGS` in `umi.conf` therefore leaves
-  `touchscreen=1` out — framebuffer plus CPU is enough for a lock screen.
-- **No firmware.** No GPU, Wi-Fi, audio or haptics blobs are fetched, so SpringBoard gets software
-  rendering only.
-- **Kernel-side device code is still redwood's**: buttons, CPU frequency, watchdog and the GPU/Wi-Fi/
-  audio drivers all describe SM7325. `docs/PORTING.md` §3 lists what each one needs.
+  `touchscreen=1` out. `docs/PORTING.md` §3 lists what the other redwood-specific kernel drivers
+  (buttons, CPU frequency, watchdog, GPU, Wi-Fi, audio) each need to become umi's.
+- **No firmware.** No GPU, Wi-Fi, audio or haptics blobs are fetched, so there is software rendering
+  only and no network.
+- **To reproduce what works now**, on a phone in Android or fastboot:
+
+      fastboot boot out-umi/umi-boot.img        # 1.5 MB, RAM only
+      ./xl ramdisk userland/system.apfs         # once per power cycle
+      XL_SECS=120 XL_CMDLINE="bootcpu=7" ./xl run
+
+`bootcpu=7` in any `xl run` is not optional — see above.
 - **If a future symptom looks like the UEFI not starting at all**, the last resort is umi's own
   drivers: extract `xbl_4` / `xbl_5` with
   [UEFIReader](https://github.com/WOA-Project/UEFIReader) and put the result in `Binaries/umi`. The
