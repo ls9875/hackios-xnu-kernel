@@ -47,13 +47,14 @@ jobs:
 
       - name: Confirm platform_umi is in the binary
         run: |
-          # the name string has to be in .rodata for the platform to be selectable at runtime
-          if strings -a xnuloader/loader.efi | grep -qx 'umi'; then
-            echo "platform_umi present"
-          else
-            echo "::error::platform_umi not found in loader.efi"
-            exit 1
-          fi
+          # strings only prints runs of 4 or more characters by default and "umi" is three, so -n 3.
+          # Both names have to be there: the loader picks a platform by the framebuffer the UEFI
+          # reports, and a port that silently lost its entry would still build and boot as ramfb.
+          strings -a -n 3 xnuloader/loader.efi | grep -qx umi \
+            || { echo "::error::platform_umi missing from loader.efi"; exit 1; }
+          strings -a -n 3 xnuloader/loader.efi | grep -qx redwood \
+            || { echo "::error::platform_redwood missing from loader.efi"; exit 1; }
+          echo "platform_umi and platform_redwood are both in the binary"
 
       - uses: actions/upload-artifact@v4
         with:
