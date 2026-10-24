@@ -2466,7 +2466,15 @@ wdt_arm(void)
 {
 	uint64_t ctl = 0, since = 0;
 
-	if (PLAT != &platform_redwood) {
+	/*
+	 * Any real phone, not just redwood. This used to be "if (PLAT != &platform_redwood) return", and
+	 * the day a second phone was tried it cost a hard hang: a kernel that takes every core leaves
+	 * the loader unable to serve USB, unable to time out, and -- with no watchdog armed -- unable to
+	 * give the phone back. The phone had to be power-cycled by hand. A watchdog is exactly what that
+	 * situation is for; the only platform it is useless on is QEMU, where the SMC is not routed
+	 * anywhere meaningful.
+	 */
+	if (PLAT == &platform_qemu_virt) {
 		return; /* SMC is not routed anywhere useful on QEMU virt */
 	}
 	uint64_t st = smc_call(VIRT_WDT_STATUS, 0, 0, &ctl, &since);

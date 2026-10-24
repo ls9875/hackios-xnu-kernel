@@ -101,18 +101,60 @@ INF at `Source/ThirdParty/Google/Driver/android_winusb.inf`; install it elevated
 
     pnputil /add-driver "<path>\android_winusb.inf" /install
 
+## What the phone actually does
+
+Recorded on the real device, 24 October, after the port was rebased on alioth.
+
+**The UEFI comes up and the loader reports over USB.** This is the milestone the port was missing
+for two attempts:
+
+    == XNULOADER v3 ==
+    CurrentEL=1 MIDR=51df805e MMFR0=101122 CNTFRQ=19200000 image=a1000000
+    display 1080 x 2340 at 9c000000
+    platform umi
+    usb: started
+
+`display 1080 x 2340 at 9c000000` settles two things at once: `FB_BASE=0x9C000000` was right (it was
+derived from the memory map, not measured), and the panel is driven at umi's real 2340, not alioth's
+2400. `platform umi` means the framebuffer base matched, so `platform_umi` was picked. A screenshot
+taken through the loader shows the Project Silicium splash underneath that text, so the display is
+not just initialised, it is drawing.
+
+**The kernel boots into user space.** With `root.apfs` as the root it gets all the way here:
+
+    gic: v3, distributor ..., redistributor ..., virtual timer on PPI 27
+    vm_page_bootstrap: 387079 free pages, 6137 wired pages
+    MiniIOMobileFramebuffer: display 1125x2436 on a panel of 1080x2340 (4320 bytes per row)
+    BSD root: md0, major 1, minor 0
+    apfs: volume 0 "redwood" ...: 60 files, 17 directories
+    bsd_init: done
+    load_init_program: attempting to load /sbin/launchd
+
+and then panics with `Process 1 exec of /sbin/launchd failed, errno 2`. That is expected and is not
+a porting fault: `root.apfs` is the 4 MB image that belongs on `/redwood`, and it becomes the root
+only when no system image is resident. `xl ramdisk userland/system.apfs` (2.5 GB, 26 MB/s over this
+cable) is what makes the big image the root.
+
+**`bootcpu=7` is not optional.** The first attempt with the resident image passed `cpus=8` without
+it. The kernel then started on the core the firmware hands over — which is the core the loader
+watches from — took every core, and the phone hung with nothing on the wire: `fastboot devices`
+printed `????????????` and every `getvar` timed out. No watchdog was armed (see below), so it had to
+be power-cycled by hand. `wdt_arm()` used to return early for anything that was not redwood; it now
+returns early only for `platform_qemu_virt`, so a hang on any real phone resets itself after 30 s.
+
 ## Not done yet
 
-- **The screen is unverified.** `FB_BASE=0x9C000000` follows from the map, and the map now comes from
-  a Xiaomi SM8250 device rather than a OnePlus one, but whether alioth's display driver drives umi's
-  panel is still a question only the phone answers. If the boot is black, the loader's own
-  `display 1080 x 2340 at 0x...` line gives the real base to put back into `platform_umi`.
-- **If alioth's drivers are still not enough**, the next step is umi's own: extract `xbl_4` / `xbl_5`
-  with [UEFIReader](https://github.com/WOA-Project/UEFIReader) and put the result in `Binaries/umi`.
-  The phone has no root (`ro.debuggable=0`), so that means either a Mi 10 fastboot ROM (~5 GB) or
-  booting a TWRP image to get a root shell and `dd` the partition.
+- **SpringBoard.** The kernel reaches `load_init_program`; getting past it needs the resident system
+  image and, after that, whatever the boot log says next. Nothing beyond `launchd` has been run.
 - **No touch driver.** umi is an ST Focaltech part on GENI I2C SE13 (`3-0049`); the kernel in this
   tree has redwood's Goodix GT9916 over bit-banged SPI. `BOOTARGS` in `umi.conf` therefore leaves
   `touchscreen=1` out — framebuffer plus CPU is enough for a lock screen.
 - **No firmware.** No GPU, Wi-Fi, audio or haptics blobs are fetched, so SpringBoard gets software
   rendering only.
+- **Kernel-side device code is still redwood's**: buttons, CPU frequency, watchdog and the GPU/Wi-Fi/
+  audio drivers all describe SM7325. `docs/PORTING.md` §3 lists what each one needs.
+- **If a future symptom looks like the UEFI not starting at all**, the last resort is umi's own
+  drivers: extract `xbl_4` / `xbl_5` with
+  [UEFIReader](https://github.com/WOA-Project/UEFIReader) and put the result in `Binaries/umi`. The
+  phone has no root (`ro.debuggable=0`), so that means either a Mi 10 fastboot ROM (~5 GB) or booting
+  a TWRP image to get a root shell and `dd` the partition.
