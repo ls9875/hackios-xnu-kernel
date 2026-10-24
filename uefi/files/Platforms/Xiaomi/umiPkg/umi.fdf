@@ -96,9 +96,12 @@ READ_LOCK_STATUS   = TRUE
   INF RuleOverride = ACPITABLE kebab/AcpiTables.inf
 
   # Device Tree
+  # Not embedded in the FD: umi's device tree travels in the boot image instead, appended after the
+  # gzipped kernel by mkxnuimg.py (Resources/DTBs/umi.dtb, see Resources/Configs/umi.toml
+  # append_dtb). Kept commented out, as kebab has it.
   #INF EmbeddedPkg/Drivers/DtPlatformDxe/DtPlatformDxe.inf
   #FILE FREEFORM = 25462CDA-221F-47DF-AC1D-259CFAA4E326 {
-  #  SECTION RAW = umiPkg/FdtBlob/sm7325-xiaomi-lisa.dtb
+  #  SECTION RAW = umiPkg/FdtBlob/umi.dtb
   #  SECTION UI = "DeviceTreeBlob"
   #}
 
