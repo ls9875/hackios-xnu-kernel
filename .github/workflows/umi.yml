@@ -21,7 +21,10 @@ on:
         default: false
 
 concurrency:
-  group: umi-${{ github.ref }}
+  # One group per ref *and* per kind of run. Grouping on the ref alone serialised everything: an
+  # images run (up to 5 h) would sit in front of a UEFI run, and the two share nothing but a checkout.
+  # Two UEFI runs still queue behind each other, which is what the group is for.
+  group: umi-${{ github.ref }}-uefi-${{ github.event.inputs.uefi }}-images-${{ github.event.inputs.images }}
   cancel-in-progress: false
 
 jobs:
