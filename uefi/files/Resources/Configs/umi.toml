@@ -7,9 +7,15 @@ requires_kernel_header = true
 #
 # UEFI FD Configs
 #
+# 0x9FC00000 + 0x300000 is the "UEFI FD" region of the phone's memory map
+# (Platforms/Xiaomi/umiPkg/Library/MemoryMapLib/MemoryMapLib.c), and it is kebab's value unchanged:
+# both are SM8250, and on umi everything up to 0x9E400000 is splash/dfps, so 0x9FC00000 is free DDR
+# above it. redwood's 0x9FD00000 + 0x200000 is NOT used here -- that is SM7325, a different layout
+# with a separate "FD Reserved" region in front of the FD.
+#
 [uefi_fd]
-base = 0x9FD00000
-size = 0x200000
+base = 0x9FC00000
+size = 0x300000
 
 #
 # Android Boot Image Kernel Configs

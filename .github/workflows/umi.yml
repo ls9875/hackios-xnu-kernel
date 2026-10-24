@@ -104,12 +104,24 @@ jobs:
       - name: Build
         working-directory: Mu-Silicium
         run: |
+          # pipefail: `| tee` on its own reports tee's exit code, so a failed build_uefi.py still looked
+          # green and the only artefact was a 68-byte log. The FD check below is the second belt.
+          set -o pipefail
           python3 -m venv ../venv
           ../venv/bin/pip install -q --upgrade pip
           ../venv/bin/pip install -q -r pip-requirements.txt
           ../venv/bin/python3 build_uefi.py -d umi -r RELEASE 2>&1 | tee ../uefi-build.log
           echo "--- tail ---"
           tail -40 ../uefi-build.log
+          FD=Build/umiPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
+          if [ ! -s "$FD" ]; then
+            echo "::error::build_uefi.py returned 0 but $FD is missing or empty"
+            ls -la Build/umiPkg 2>/dev/null || echo "no Build/umiPkg at all"
+            exit 1
+          fi
+          echo "SILICIUM_UEFI.fd $(stat -c %s $FD) bytes"
+          # 0x9FC00000 is where the shim will put this: FV base must agree with umi.toml
+          od -An -tx4 -N4 "$FD"
 
       - name: Collect
         if: always()

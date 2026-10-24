@@ -23,10 +23,11 @@ static const struct platform platform_umi = {
 	 */
 	.small_cores = 0x0f,
 	/*
-	 * TODO(umi): unknown until the UEFI has run once. The loader prints it at start:
-	 *     display 1080 x 2340 at <this value>
-	 * Fill it in and rebuild with xnuloader/build.sh; until then no platform matches and the loader
-	 * treats the panel as QEMU's ramfb (which still prints the line above).
+	 * The base of the "Display Reserved" region in the memory map the umi UEFI installs (see
+	 * uefi/files/Platforms/Xiaomi/umiPkg/Library/MemoryMapLib/MemoryMapLib.c), which is what its GOP
+	 * reports -- the same relationship redwood's 0xE1000000 has to its own map. Not yet confirmed on
+	 * hardware: if the panel stays dark, the loader's first lines say what the firmware really
+	 * reported ("display 1080 x 2340 at ...") and this is the value to put here.
 	 */
-	.fb_base = 0x0,
+	.fb_base = 0x9C000000,
 };

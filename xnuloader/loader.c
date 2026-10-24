@@ -566,11 +566,13 @@ static const struct platform platform_umi = {
 	/* Cores 0-3 are Cortex-A55s, 4-7 Cortex-A77s (2.42 GHz): 1894 against 1024 in the DT. */
 	.small_cores = 0x0f,
 	/*
-	 * TODO(umi): unknown until a umi UEFI has run once; the loader prints it at start as
-	 * "display 1080 x 2340 at ...". Until this is filled in nothing matches, the panel goes down
-	 * the ramfb path -- and that line is still printed, which is how the value is found.
+	 * The base of the "Display Reserved" region in the memory map the umi UEFI installs
+	 * (uefi/files/Platforms/Xiaomi/umiPkg/Library/MemoryMapLib/MemoryMapLib.c), which is what its GOP
+	 * reports -- the same relationship redwood's 0xE1000000 has to its own map. Not yet confirmed on
+	 * hardware: if the panel stays dark, the loader's first lines say what the firmware really
+	 * reported ("display 1080 x 2340 at ...") and this is the value to put here.
 	 */
-	.fb_base = 0x0,
+	.fb_base = 0x9C000000,
 };
 
 /*
