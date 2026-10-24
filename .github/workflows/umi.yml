@@ -184,6 +184,14 @@ jobs:
           7z 2>&1 | head -2
 
       - name: Workspace (common/setup.sh)
+        # common/setup.sh clones hackios-xnu-userland into this tree. Pointed at a fork for one
+        # reason: userland/build.sh copies obj/drawable_test unconditionally, and prebuilt/userland
+        # (what a runner without ld64 falls back to) predates that program, so the build died at
+        # `cp: cannot stat 'obj/drawable_test'` and produced no images. The fork carries a one-line
+        # fix -- the same `[ -f ... ] &&` guard every other program on that line already had. Drop
+        # USERLAND_URL once that is upstream.
+        env:
+          USERLAND_URL: https://github.com/ls9875/hackios-xnu-userland.git
         run: bash common/setup.sh
 
       - name: iOS 16.5 out of Apple's IPSW (7.4 GB)
@@ -191,19 +199,27 @@ jobs:
 
       - name: Images
         run: |
+          # pipefail for the same reason as the UEFI build: this reported success once already while
+          # userland/build.sh had died on its first cp.
+          set -o pipefail
           SKIP="kernel boot" bash common/build.sh umi 2>&1 | tee images-build.log
           tail -30 images-build.log
+          for f in userland/root.apfs userland/system.apfs; do
+            [ -s "$f" ] || { echo "::error::$f was not produced"; ls -la userland/ || true; exit 1; }
+          done
+          ls -la userland/*.apfs
 
       - name: Collect
         if: always()
         run: |
-          mkdir -p out
-          cp images-build.log out/ 2>/dev/null || true
-          ls -la out/ || true
+          mkdir -p dist
+          cp userland/root.apfs userland/system.apfs dist/ 2>/dev/null || true
+          cp images-build.log dist/ 2>/dev/null || true
+          ls -la dist/ || true
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: umi-images
-          path: out/
+          path: dist/
           if-no-files-found: warn
