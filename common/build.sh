@@ -17,6 +17,10 @@
 load_device "$1"; shift
 skip() { [[ " $SKIP " == *" $1 "* ]]; }
 mkdir -p out
+# `xl` builds the same image as step 4 below (enter()), and its UEFI is linked for this device's FD
+# base and size: say which device that is, so a bare `./xl enter` afterwards does not fall back to
+# redwood's addresses.
+echo "$DEVICE" > out/.device
 
 if ! skip kernel; then
 	if [ -d "${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk" ] && command -v clang >/dev/null; then

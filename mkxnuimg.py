@@ -8,7 +8,8 @@ into an Android boot image for `fastboot boot`.
 The boot shim copies the FD to its base and the payload to PAYLOAD_BASE.
 
 The UEFI pieces are taken from a Mu-Silicium tree built here (Mu-Silicium/, see uefi/README.md)
-or, when there is none, from prebuilt/uefi/.
+or, when there is none, from prebuilt/uefi/ -- or prebuilt/uefi/<target>/ for a device that is not
+redwood, whose shim and FD are linked for its own addresses.
 
 usage: mkxnuimg.py [-p payload.bin] [-o out.img]
 
@@ -47,8 +48,14 @@ if os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
              'dtb': os.path.join(MU, f'Resources/DTBs/{TARGET}.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
              'mkbootimg': os.path.join(MU, 'Resources/Scripts/mkbootimg.py')}
 else:
-    parts = {'shim': os.path.join(PREBUILT, 'BootShim.bin'), 'fd': os.path.join(PREBUILT, 'SILICIUM_UEFI.fd'),
-             'dtb': os.path.join(PREBUILT, 'redwood.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
+    # prebuilt/uefi/<target>/ when the device is not the one this repository was built for. Its shim
+    # and its FD are compiled for its own FD_BASE and FD_SIZE, so neither can stand in for redwood's:
+    # a shim built for 0x9FD00000/0x200000 that copies to 0x9FC00000 does not fail, it just never boots.
+    pb = os.path.join(PREBUILT, TARGET)
+    if not os.path.isdir(pb):
+        pb = PREBUILT
+    parts = {'shim': os.path.join(pb, 'BootShim.bin'), 'fd': os.path.join(pb, 'SILICIUM_UEFI.fd'),
+             'dtb': os.path.join(pb, f'{TARGET}.dtb'), 'ramdisk': os.path.join(PREBUILT, 'ramdisk'),
              'mkbootimg': os.path.join(PREBUILT, 'mkbootimg.py')}
     if os.environ.get('UEFI_FD'): parts['fd'] = os.environ['UEFI_FD']
 shim = open(parts['shim'], 'rb').read()

@@ -1,9 +1,10 @@
 ##
 #  Xiaomi Mi 10 (umi) -- Snapdragon 865 / SM8250 "kona", for HackiOS.
 #
-#  Derived from Platforms/OnePlus/kebabPkg (OnePlus 8T), the only SM8250 device in Mu-Silicium:
-#  the SoC include (KonaPkg), SOC_TYPE and the ACPI tables come from there unchanged. What differs is
-#  this device's identity and the panel: umi is 1080x2340, kebab 1080x2400.
+#  Derived from Platforms/Xiaomi/aliothPkg (POCO F3 / Redmi K40, SM8250-AC = Snapdragon 870), which is
+#  the same silicon from the same vendor: the SoC include (KonaPkg) and the ACPI tables come from there
+#  unchanged, and its UEFI driver set is Xiaomi's own. What differs is the device's identity, SOC_TYPE
+#  (umi is plain SM8250, alioth SM8250-AC) and the panel: umi is 1080x2340, alioth 1080x2400.
 #
 #  Copyright (c) 2011 - 2022, ARM Limited. All rights reserved.
 #  Copyright (c) 2014, Linaro Limited. All rights reserved.
@@ -36,7 +37,7 @@
   # 1 = SM8250-AB
   # 2 = SM8250-AC
   #
-  # Mi 10 is plain SM8250 -- the same value kebab (OnePlus 8T) uses.
+  # Mi 10 is plain SM8250 -- alioth is SM8250-AC (Snapdragon 870), hence 0 rather than 2.
   #
   SOC_TYPE                       = 0
 
@@ -92,6 +93,7 @@
   #
   # ACPI Tables
   #
-  # kebab's tables: same SoC, so the same interrupt controller, timers and UARTs.
+  # alioth's tables: same SoC family, so the same interrupt controller, timers and UARTs. Silicium-ACPI
+  # keeps them under Platforms/Xiaomi/alioth, which is why this line says alioth and not umi.
   #
-  kebab/AcpiTables.inf
+  alioth/AcpiTables.inf

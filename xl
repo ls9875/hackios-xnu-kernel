@@ -24,6 +24,9 @@
 #   xl state            where is the phone right now
 #
 # Logs land in logs/. Environment for `run`:
+#   DEVICE      which common/devices/<name>.conf to take the UEFI's addresses from (default: whatever
+#               `common/build.sh <device>` last wrote in out/.device, and redwood if there is none).
+#               `common/run.sh <device>` sets it for you; `./xl enter` on its own does not.
 #   XL_CMDLINE  extra kernel boot-args; default "-v": the boot is shown as text on the phone's screen
 #               (XL_CMDLINE="" for a blank screen, XL_CMDLINE="-v systrace=1" to trace failing syscalls)
 #   XL_SECS     seconds after which the kernel returns to the loader on its own (default 8)
@@ -50,6 +53,23 @@ K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bc
 L=xnuloader/loader.efi
 [ -f $L ] || L=prebuilt/loader.efi
 mkdir -p logs
+# The UEFI the image here carries is linked for one FD base and one FD size, and the shim inside it
+# copies the FD there. mkxnuimg.py's own defaults are redwood's (0x9FD00000, 0x200000), which is
+# right for the device this repository came from and wrong for every other: a shim built for those
+# addresses, handed a 3 MB FD that belongs at 0x9FC00000, does not report anything -- it copies the
+# FD over whatever lives at 0x9FD00000 and the phone never boots. So take them from the device
+# profile. DEVICE comes from `common/run.sh <device>` or `common/build.sh <device>` (out/.device);
+# with neither, this stays redwood, as it always was.
+DEVICE=${DEVICE:-$(cat out/.device 2>/dev/null)}
+if [ -n "$DEVICE" ] && [ -f common/devices/$DEVICE.conf ]; then
+	_env_uefi_fd=${UEFI_FD:-}
+	_env_dtb=${DTB:-}
+	# shellcheck disable=SC1090
+	. common/devices/$DEVICE.conf
+	# a file named on the command line wins over the profile's (usually empty) one
+	UEFI_FD=${_env_uefi_fd:-${UEFI_FD:-}} DTB=${_env_dtb:-${DTB:-}}
+	export DEVICE FD_BASE FD_SIZE PAYLOAD_BASE UEFI_TARGET UEFI_FD DTB
+fi
 # There is one phone, whichever working copy (tools/new-workspace.sh) talks to it: the locks are
 # outside all of them.
 PHONE=${XDG_RUNTIME_DIR:-/tmp}/hackios-phone

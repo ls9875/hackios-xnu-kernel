@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       uefi:
-        description: "Build the Mu-Silicium UEFI for umi (umiPkg from kebabPkg)"
+        description: "Build the Mu-Silicium UEFI for umi (umiPkg from aliothPkg)"
         type: boolean
         default: true
       images:
@@ -93,7 +93,7 @@ jobs:
           # the shim's build needs make + an aarch64 gcc; the port's patch expects both to exist
           echo "Mu-Silicium at $(git -C Mu-Silicium rev-parse --short HEAD)"
 
-      - name: Turn kebab into umi (uefi/umi-port.sh)
+      - name: Turn alioth into umi (uefi/umi-port.sh)
         run: bash uefi/umi-port.sh
 
       - name: mu_nasm without Mono (uefi/README.md)

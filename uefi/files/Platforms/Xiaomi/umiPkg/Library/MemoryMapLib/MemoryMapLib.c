@@ -3,32 +3,36 @@
 /*
  * Xiaomi Mi 10 (umi, SM8250 "kona") memory map.
  *
- * Derived from Platforms/OnePlus/kebabPkg/Library/MemoryMapLib/MemoryMapLib.c (OnePlus 8T), because
- * that is the only SM8250 device in Mu-Silicium. Three things were checked against umi's own device
- * tree (the dtb set in its boot.img, see PORT-UMI.md) and one had to be changed:
+ * This is Platforms/Xiaomi/aliothPkg/Library/MemoryMapLib/MemoryMapLib.c (POCO F3 / Redmi K40,
+ * SM8250-AC = Snapdragon 870) with one entry added. alioth is the same silicon from the same vendor,
+ * and its DDR reservations match umi's own device tree -- not approximately, region for region:
  *
- *   kebab                       umi's /reserved-memory                      verdict
- *   HYP 0x80000000+0x00600000   hyp_region@80000000 +0x600000              same
- *   AOP CMD DB 0x80860000       reserved-memory@80860000 +0x20000          same
- *   SMEM 0x80900000+0x00200000  smem_region@80900000 +0x200000             same
- *   TZApps 0x82400000+0x09600000 removed_region@80b00000 +0x5300000        covered
- *   PIL 0x8BF00000+0x06500000   pil_* / cdsp_secure_heap, ends 0x92700000  covered (0x92400000)
- *   Display 0x9C000000+0x02400000 cont_splash@9c000000 + dfps@9e300000     same, ends 0x9E400000
- *   UEFI FD 0x9FC00000+0x00300000 (nothing -- free DDR above the splash)   same
+ *   alioth map                                umi's /reserved-memory                     verdict
+ *   HYP              0x80000000+0x00600000    hyp_region@80000000 +0x600000              same
+ *   AOP CMD DB       0x80860000+0x00020000    reserved-memory@80860000 +0x20000          same
+ *   SMEM             0x80900000+0x00200000    smem_region@80900000 +0x200000             same
+ *   QTEE + TZApps    0x80B00000+0x05300000    removed_region@80b00000 +0x5300000         same, exactly
+ *   PIL Reserved     0x86200000+0x0C500000    pil_adsp/camera/cdsp/cvp/gpu/npu/...       same, ends 0x92700000
+ *   Display Reserved 0x9C000000+0x02400000    cont_splash@9c000000 + dfps@9e300000       same, ends 0x9E400000
+ *   UEFI FD          0x9FC00000+0x00300000    (free DDR above the splash)                free, see below
+ *   UEFI Stack       0x9FF90000+0x00040000    (nothing)                                  PcdCPUCoresStackBase
  *
- * The change: kebab reserves {"Kernel", 0xA0000000, 0x10000000} and then puts its DXE heap at
- * 0xB0000000 with a length of 0x04500000, which reaches 0xF5000000. 0xF0000000 is PAYLOAD_BASE --
- * the address the boot shim copies the XNU container to and BootManagerLib starts it from (both
- * hardcoded: xnuloader/loader.c and SiliciumPkg/Library/BootManagerLib/XnuLoader.h). A UEFI built
- * with kebab's heap would therefore allocate pages on top of the kernel before it ever ran.
+ * The earlier version of this port used kebab's (OnePlus 8T) map instead. Two things were wrong with
+ * it. It reserved {"Kernel", 0xA0000000, 0x10000000} and put its DXE heap at 0xB0000000 with a length
+ * of 0x04500000, reaching 0xF5000000 -- over PAYLOAD_BASE. And, more fundamentally, kebab's map only
+ * agreed with umi's device tree in the display region, while alioth's agrees everywhere.
  *
- * So the heap is cut to 256 MB (0xB0000000..0xC0000000) and 0xF0000000+0x04000000 is reserved for the
- * payload explicitly, which is the shape redwood uses too ({"XNU Payload", 0xF0000000, 0x04000000}).
+ * The one entry added here is {"XNU Payload", 0xF0000000, 0x04000000}. 0xF0000000 is where the boot
+ * shim copies the "XNUP" container and where BootManagerLib starts it from (both hardcoded:
+ * xnuloader/loader.c and SiliciumPkg/Library/BootManagerLib/XnuLoader.h). It is not in alioth's map at
+ * all, so nothing there would touch it -- but "nothing would touch it" is the kind of assumption that
+ * costs a day when it turns out to be wrong, and redwood reserves it explicitly for the same reason.
+ * PAYLOAD_MAX is 0x04000000 (mkxnuimg.py asserts it), hence the length.
  *
- * Known and deliberate: PIL Reserved stops at 0x92400000 while umi's cdsp_secure_heap runs to
- * 0x92700000, so 3 MB of CDSP memory is not marked reserved here. Nothing in the UEFI allocates from
- * a region that is not listed, so that only means the DSP keeps its memory; it is left as kebab has it
- * rather than inventing a boundary the phone never told us.
+ * "Display Reserved" is also FB_BASE: the UEFI's GOP reports this address as its framebuffer base and
+ * xnuloader picks platform_umi by it (common/devices/umi.conf). Same relationship as redwood's
+ * 0xE1000000. "UEFI FD" has to stay in step with FD_BASE/FD_SIZE in Resources/Configs/umi.toml and
+ * common/devices/umi.conf, and "UEFI Stack" with PcdCPUCoresStackBase in umi.dsc.
  */
 STATIC
 EFI_MEMORY_REGION_DESCRIPTOR
@@ -36,32 +40,25 @@ gMemoryDescriptor[] = {
   // Name, Address, Length, HobOption, ResourceType, ResourceAttribute, MemoryType, ArmAttribute
 
   // DDR Regions
-  {"HYP",              0x80000000, 0x00600000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, NS_DEVICE},
-  {"MPSS EFS",         0x80600000, 0x00100000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
+  {"HYP",              0x80000000, 0x00600000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, NS_DEVICE},
   {"AOP CMD DB",       0x80860000, 0x00020000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+  {"GPU PRR",          0x80880000, 0x00010000, AddMem, MEM_RES, WRITE_COMBINEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
   {"SMEM",             0x80900000, 0x00200000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
-  {"TZApps Reserved",  0x82400000, 0x09600000, HobOnlyNoCacheSetting, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
-  {"PIL Reserved",     0x8BF00000, 0x06500000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
-  {"Sched Heap",       0x9BC00000, 0x00400000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
-  // The panel: the UEFI's GOP reports this address as its framebuffer base, and xnuloader picks
-  // platform_umi by it (FB_BASE in common/devices/umi.conf). Same relationship as redwood's
-  // 0xE1000000 "Display Reserved" == its fb_base.
+  {"QTEE",             0x80B00000, 0x01900000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+  {"TZApps",           0x82400000, 0x03A00000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+  {"PIL Reserved",     0x86200000, 0x0C500000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+  {"ADSP RPC",         0x92700000, 0x00800000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},
+  // Ends at 0x9BC00000: below the panel, and nowhere near PAYLOAD_BASE.
+  {"DXE Heap",         0x98900000, 0x03300000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
+  // The panel. FB_BASE in common/devices/umi.conf and platform_umi.fb_base in xnuloader/loader.c.
   {"Display Reserved", 0x9C000000, 0x02400000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_THROUGH_XN},
-  {"DBI Dump",         0x9E400000, 0x00F00000, NoHob,  MMAP_IO, INITIALIZED, Conv,   UNCACHED_UNBUFFERED_XN},
-  {"FV Region",        0x9F800000, 0x00200000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
-  {"ABOOT FV",         0x9FA00000, 0x00200000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
   // FD_BASE/FD_SIZE in Resources/Configs/umi.toml and common/devices/umi.conf have to agree with this.
   {"UEFI FD",          0x9FC00000, 0x00300000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK},
-  {"SEC Heap",         0x9FF00000, 0x0008C000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
-  {"MMU PageTables",   0x9FF8D000, 0x00003000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
+  // PcdCPUCoresStackBase/PcdCPUCorePrimaryStackSize in umi.dsc.
   {"UEFI Stack",       0x9FF90000, 0x00040000, AddMem, SYS_MEM, SYS_MEM_CAP, BsData, WRITE_BACK_XN},
-  {"Log Buffer",       0x9FFF7000, 0x00008000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
   {"Info Blk",         0x9FFFF000, 0x00001000, AddMem, SYS_MEM, SYS_MEM_CAP, RtData, WRITE_BACK_XN},
-  // Where the ABL leaves the boot image (kebab's value, kept: same SoC, same boot chain).
-  {"Kernel",           0xA0000000, 0x10000000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
-  // 256 MB instead of kebab's 0x04500000, so that the heap cannot reach PAYLOAD_BASE at 0xF0000000.
-  {"DXE Heap",         0xB0000000, 0x10000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv,   WRITE_BACK_XN},
-  // PAYLOAD_BASE, and PAYLOAD_MAX = 0x04000000 (mkxnuimg.py, xnuloader/loader.c).
+  // PAYLOAD_BASE, PAYLOAD_MAX = 0x04000000 (mkxnuimg.py, xnuloader/loader.c). The one entry that is
+  // this port's own addition -- see the comment above.
   {"XNU Payload",      0xF0000000, 0x04000000, AddMem, SYS_MEM, SYS_MEM_CAP, Reserv, WRITE_BACK_XN},
 
   // Other Memory Regions
@@ -71,10 +68,10 @@ gMemoryDescriptor[] = {
   // Register Regions
   {"IPC_ROUTER_TOP",   0x00400000, 0x00100000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"SECURITY CONTROL", 0x00780000, 0x00007000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
+  {"PRNG_CFG_PRNG",    0x00790000, 0x00010000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"QUPV3_2_GSI",      0x00800000, 0x000D0000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"QUPV3_0_GSI",      0x00900000, 0x000D0000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"QUPV3_1_GSI",      0x00A00000, 0x000D0000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
-  {"PRNG_CFG_PRNG",    0x00790000, 0x00010000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"CRYPTO0 CRYPTO",   0x01DC0000, 0x00040000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"TCSR_TCSR_REGS",   0x01FC0000, 0x00030000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"GPU_GMU_CX_BLK",   0x02C7D000, 0x00002000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
