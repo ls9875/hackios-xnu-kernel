@@ -1,0 +1,173 @@
+name: umi
+
+# Build what the Mi 10 (umi, SM8250) port needs, on a Linux host, without a Linux host.
+#
+#   loader  always   -- proves xnuloader's platform_umi compiles; artifact loader.efi
+#   uefi    optional -- Mu-Silicium with Platforms/Xiaomi/umiPkg; artifact SILICIUM_UEFI.fd
+#   images  optional -- iOS 16.5 out of Apple's IPSW and the APFS images; artifact images
+#
+# The iOS IPSW is 7.4 GB and the images are ~2.5 GB, so `images` is the slow one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      uefi:
+        description: "Build the Mu-Silicium UEFI for umi (umiPkg from kebabPkg)"
+        type: boolean
+        default: true
+      images:
+        description: "Fetch iOS 16.5 and build the APFS images (7.4 GB download)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: umi-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  loader:
+    name: loader (platform_umi)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld
+          clang --version | head -1
+          lld-link --version
+
+      - name: Build
+        run: |
+          bash xnuloader/build.sh
+          file xnuloader/loader.efi
+          ls -la xnuloader/loader.efi
+
+      - name: Confirm platform_umi is in the binary
+        run: |
+          # the name string has to be in .rodata for the platform to be selectable at runtime
+          if strings -a xnuloader/loader.efi | grep -qx 'umi'; then
+            echo "platform_umi present"
+          else
+            echo "::error::platform_umi not found in loader.efi"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: umi-loader
+          path: xnuloader/loader.efi
+          if-no-files-found: error
+
+  uefi:
+    name: UEFI (Mu-Silicium umiPkg)
+    if: ${{ inputs.uefi }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm nasm python3 python3-pip python3-venv \
+            gcc-aarch64-linux-gnu build-essential uuid-dev iasl git
+          clang --version | head -1
+          nasm -v
+
+      - name: Mu-Silicium + the redwood port (uefi/apply.sh)
+        run: |
+          bash uefi/apply.sh
+          # the shim's build needs make + an aarch64 gcc; the port's patch expects both to exist
+          echo "Mu-Silicium at $(git -C Mu-Silicium rev-parse --short HEAD)"
+
+      - name: Turn kebab into umi (uefi/umi-port.sh)
+        run: bash uefi/umi-port.sh
+
+      - name: mu_nasm without Mono (uefi/README.md)
+        run: |
+          D=Mu-Silicium/Mu_Basecore/BaseTools/Bin/mu_nasm_extdep
+          mkdir -p "$D/Linux-x86-64"
+          echo 'version: 20016.1.1' > "$D/extdep_state.yaml"
+          ln -sf /usr/bin/nasm /usr/bin/ndisasm "$D/Linux-x86-64/"
+          ls -la "$D/Linux-x86-64/"
+
+      - name: Build
+        working-directory: Mu-Silicium
+        run: |
+          python3 -m venv ../venv
+          ../venv/bin/pip install -q --upgrade pip
+          ../venv/bin/pip install -q -r pip-requirements.txt
+          ../venv/bin/python3 build_uefi.py -d umi -r RELEASE 2>&1 | tee ../uefi-build.log
+          echo "--- tail ---"
+          tail -40 ../uefi-build.log
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp Mu-Silicium/Build/umiPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd out/ 2>/dev/null || true
+          cp uefi-build.log out/ 2>/dev/null || true
+          ls -la out/ || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: umi-uefi
+          path: out/
+          if-no-files-found: warn
+
+  images:
+    name: iOS 16.5 images
+    if: ${{ inputs.images }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          # 7-Zip 23 or newer: it is what reads APFS
+          sudo apt-get install -y -qq 7zip clang lld gcc build-essential python3 python3-venv \
+            liblz4-dev git curl
+          7z 2>&1 | head -2
+
+      - name: Workspace (common/setup.sh)
+        run: bash common/setup.sh
+
+      - name: iOS 16.5 out of Apple's IPSW (7.4 GB)
+        run: bash ios165/fetch.sh
+
+      - name: Images
+        run: |
+          SKIP="kernel boot" bash common/build.sh umi 2>&1 | tee images-build.log
+          tail -30 images-build.log
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp images-build.log out/ 2>/dev/null || true
+          ls -la out/ || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: umi-images
+          path: out/
+          if-no-files-found: warn

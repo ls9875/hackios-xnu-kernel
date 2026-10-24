@@ -554,12 +554,33 @@ static const struct platform platform_redwood = {
 };
 
 /*
+ * Xiaomi Mi 10 (umi, Snapdragon 865 / SM8250 "kona"). Not a HackiOS target yet: this is the port in
+ * progress, see PORT-UMI.md. Everything here was read out of the phone's own device tree (the dtb set
+ * in its boot.img), not guessed -- and the GIC layout, the core count and the cluster split turned out
+ * to be identical to redwood's, so only the name and the framebuffer base differ.
+ */
+static const struct platform platform_umi = {
+	.name = "umi", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 1,
+	.cores = 8, .core_shift = 8,
+	/* Cores 0-3 are Cortex-A55s, 4-7 Cortex-A77s (2.42 GHz): 1894 against 1024 in the DT. */
+	.small_cores = 0x0f,
+	/*
+	 * TODO(umi): unknown until a umi UEFI has run once; the loader prints it at start as
+	 * "display 1080 x 2340 at ...". Until this is filled in nothing matches, the panel goes down
+	 * the ramfb path -- and that line is still printed, which is how the value is found.
+	 */
+	.fb_base = 0x0,
+};
+
+/*
  * The devices the loader knows, told apart by the framebuffer base their UEFI reports. A port to another
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
  * where each value comes from); a display that matches none is QEMU's ramfb.
  */
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_umi,
 };
 
 /* ------------------------------------------------------------------------ */
