@@ -50,6 +50,16 @@ if [ ${#rename[@]} -gt 0 ]; then
 	echo "umi-port: renamed the donor package in ${#rename[@]} copied file(s)"
 fi
 
+# DeviceBuild.py lists the directories EDK2 resolves a package name in, and kebab's lists only
+# Platforms/OnePlus. Without Platforms/Xiaomi the stuart build cannot turn "umiPkg/umi.dsc" into an
+# absolute path and stops right after setup with
+#     ERROR - Failed to convert Edk2Relative Path to an Absolute Path on this system.
+#     ERROR - Relative Path: umiPkg/umi.dsc
+# Silicium-ACPI/Platforms/OnePlus stays: it is where the kebab/AcpiTables.inf umi.dsc asks for lives.
+if ! grep -q '"Platforms/Xiaomi"' $UMI/DeviceBuild.py; then
+	sed -i 's|^\( *\)PackagesPath = (|\1PackagesPath = (\n\1    "Platforms/Xiaomi",|' $UMI/DeviceBuild.py
+fi
+
 # 1b. the memory map. kebab's is right for umi in every region the phone's device tree mentions (its
 #     "Display Reserved" 0x9C000000+0x2400000 ends exactly where umi's splash+dfps reservations end,
 #     0x9E400000), but its DXE heap runs 0xB0000000+0x4500000 and so covers 0xF0000000, which is where
@@ -89,6 +99,8 @@ done
 grep -q 'Binaries/umi/' $UMI/Include/DXE.inc || die "DXE.inc still points at Binaries/kebab"
 grep -q 'kebab/AcpiTables.inf' $UMI/umi.dsc || die "umi.dsc lost its kebab/AcpiTables.inf reference"
 grep -q 'FLASH_DEFINITION *= *umiPkg/umi.fdf' $UMI/umi.dsc || die "umi.dsc does not use umi.fdf"
+grep -q '"Platforms/Xiaomi"' $UMI/DeviceBuild.py || die "DeviceBuild.py does not resolve packages in Platforms/Xiaomi"
+grep -q 'ACTIVE_PLATFORM", "umiPkg/umi.dsc' $UMI/DeviceBuild.py || die "DeviceBuild.py still builds another platform"
 
 echo "umi-port: Platforms/Xiaomi/umiPkg ready"
 echo "umi-port:   DeviceBuild.py   $(stat -c %s $UMI/DeviceBuild.py) bytes"

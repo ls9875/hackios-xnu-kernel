@@ -123,19 +123,39 @@ jobs:
           # 0x9FC00000 is where the shim will put this: FV base must agree with umi.toml
           od -An -tx4 -N4 "$FD"
 
+      # The FD is not what you flash. `fastboot boot` needs an Android boot image holding
+      # BootShim + FD + the XNU loader payload, and that is what these two steps make:
+      # mkxnuimg.py (called by common/build.sh) rebuilds BootShim with PAYLOAD_BASE baked in.
+      - name: Loader (xnuloader/build.sh)
+        run: |
+          bash xnuloader/build.sh
+          file xnuloader/loader.efi
+          ls -la xnuloader/loader.efi
+
+      - name: Boot image for fastboot (common/build.sh umi)
+        run: |
+          set -o pipefail
+          SKIP="kernel images" bash common/build.sh umi 2>&1 | tee bootimg.log
+          tail -20 bootimg.log
+          [ -s out/umi-boot.img ] || { echo "::error::common/build.sh did not produce out/umi-boot.img"; ls -la out/ || true; exit 1; }
+          ls -la out/umi-boot.img
+
       - name: Collect
         if: always()
         run: |
-          mkdir -p out
-          cp Mu-Silicium/Build/umiPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd out/ 2>/dev/null || true
-          cp uefi-build.log out/ 2>/dev/null || true
-          ls -la out/ || true
+          # dist/, not out/: common/build.sh uses out/ for its own products
+          mkdir -p dist
+          cp Mu-Silicium/Build/umiPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd dist/ 2>/dev/null || true
+          cp Mu-Silicium/BootShim/BootShim.bin dist/ 2>/dev/null || true
+          cp out/umi-boot.img dist/ 2>/dev/null || true
+          cp uefi-build.log bootimg.log dist/ 2>/dev/null || true
+          ls -la dist/
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: umi-uefi
-          path: out/
+          path: dist/
           if-no-files-found: warn
 
   images:

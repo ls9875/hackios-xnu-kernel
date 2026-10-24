@@ -1,6 +1,10 @@
 #
 # Boot Shim Configs
 #
+# Present on purpose: build_uefi.py runs `make` in Mu-Silicium/BootShim with FD_BASE/FD_SIZE, and
+# that BootShim.bin is what hackios's mkxnuimg.py puts in front of the FD when it makes the real boot
+# image. So the shim gets built here even though this build does not pack an image.
+#
 [boot_shim]
 requires_kernel_header = true
 
@@ -13,19 +17,18 @@ requires_kernel_header = true
 # above it. redwood's 0x9FD00000 + 0x200000 is NOT used here -- that is SM7325, a different layout
 # with a separate "FD Reserved" region in front of the FD.
 #
+# mkxnuimg.py asserts the FD is exactly this many bytes, so the two have to stay in step.
+#
 [uefi_fd]
 base = 0x9FC00000
 size = 0x300000
 
 #
-# Android Boot Image Kernel Configs
+# No [boot_image] / [boot_image_kernel] on purpose.
 #
-[boot_image_kernel]
-kernel_compression = "gzip"
-append_dtb         = true
-
+# With them build_uefi.py also packs Mu's own boot image -- BootShim + FD + Mu's ramdisk -- and that is
+# not what this port boots. HackiOS boots `out/umi-boot.img`, which mkxnuimg.py makes from the same FD
+# plus the XNU loader payload and umi's own device tree. Leaving the section out makes
+# create_output_image() log "No Output Format was Specified" and return, so the one artefact this job
+# is responsible for is the FD.
 #
-# Android Boot Image Configs
-#
-[boot_image]
-header_version = 1
