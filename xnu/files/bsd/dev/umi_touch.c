@@ -494,10 +494,27 @@ report_touch(uint32_t id, uint32_t event, uint32_t x, uint32_t y)
 static void
 parse_report(const uint8_t *report)
 {
+	/*
+	 * report[1]'s low nibble is how many fingers the chip is reporting. It is not decoration:
+	 * a report of all zeros is what a bus that reads back nothing looks like, and taking its
+	 * ten empty slots at face value -- id 0, event 0 (down), x and y zero -- posted a finger
+	 * pressed in the top-left corner every 16 ms for as long as the run lasted.
+	 */
+	uint32_t fingers = report[1] & 0x0f;
+
 	for (uint32_t i = 0; i < FTS_MAX_TOUCHES; i++) {
 		contact[i].seen = false;
 	}
-	for (uint32_t i = 0; i < FTS_MAX_TOUCHES; i++) {
+	if (fingers == 0 || fingers > FTS_MAX_TOUCHES) {
+		for (uint32_t i = 0; i < FTS_MAX_TOUCHES; i++) {
+			if (contact[i].down) {
+				contact[i].down = false;
+				redwood_touch_post(REDWOOD_TOUCH_UP, i, contact[i].x, contact[i].y);
+			}
+		}
+		return;
+	}
+	for (uint32_t i = 0; i < fingers; i++) {
 		const uint8_t *t = report + 2 + 6 * i;
 		uint32_t id = (t[2] >> 4) & 0x0f;
 		uint32_t event, x, y;
@@ -556,7 +573,17 @@ line_test(void)
 		gpio_output(pin, true, PULL_NONE, 2);
 		printf("umi_touch: ... gpio%u driven high -> %u\n", pin, gpio_get(pin));
 		gpio_configure(pin, 0, PULL_UP, 2, false);
+		/*
+		 * Read it again later, because the first read after the driver lets go cannot tell a
+		 * pull-up from the capacitance of the line and a read that is simply too soon: what
+		 * comes back at once says nothing, and what is still there 200 us and 2 ms later says
+		 * whether anything is really holding the line up.
+		 */
 		printf("umi_touch: ... gpio%u released, pull-up on -> %u\n", pin, gpio_get(pin));
+		sleep_us(200);
+		printf("umi_touch: ... gpio%u released, 200 us later -> %u\n", pin, gpio_get(pin));
+		sleep_ms(2);
+		printf("umi_touch: ... gpio%u released, 2 ms later -> %u\n", pin, gpio_get(pin));
 	}
 }
 
