@@ -56,6 +56,7 @@
  *   umi_touch_wtest=1   write a byte to three registers and read it back, then stop
  *   umi_touch_settle_ms=N  how long the chip gets between the reset and the first read (200)
  *   umi_touch_reg16=1   send a two-byte register address instead of one
+ *   umi_touch_sweep=1   try every protocol variant in one boot and print one line each
  *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
  *                       low, 2 does not touch it -- one of the three is the chip out of reset
  *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
@@ -295,6 +296,8 @@ static bool pushpull;
  * low half that never comes, and answer nothing. One boot argument tells the two apart.
  */
 static bool reg16;
+static bool norepeat;                   /* umi_touch_sweep: stop, then start again, instead of repeating */
+static uint8_t bus_address = I2C_ADDRESS;
 
 /*
  * Where the bring-up is, one line per step. A run that stops leaves its last line behind, so
@@ -500,10 +503,13 @@ i2c_read_registers(uint8_t reg, uint8_t *data, uint32_t length)
 	bool ok = false;
 
 	i2c_start();
-	if (i2c_write_byte(I2C_ADDRESS << 1) && (reg16 ? i2c_write_byte(0x00) : true) &&
+	if (i2c_write_byte(bus_address << 1) && (reg16 ? i2c_write_byte(0x00) : true) &&
 	    i2c_write_byte(reg)) {
-		i2c_start();                                   /* repeated start */
-		if (i2c_write_byte(I2C_ADDRESS << 1 | 1)) {
+		if (norepeat) {
+			i2c_stop();
+		}
+		i2c_start();                                   /* repeated start, unless asked for a stop */
+		if (i2c_write_byte(bus_address << 1 | 1)) {
 			for (uint32_t i = 0; i < length; i++) {
 				data[i] = i2c_read_byte(i + 1 < length);
 			}
@@ -520,7 +526,7 @@ i2c_write_registers(uint8_t reg, const uint8_t *data, uint32_t length)
 	bool ok;
 
 	i2c_start();
-	ok = i2c_write_byte(I2C_ADDRESS << 1) && (reg16 ? i2c_write_byte(0x00) : true) &&
+	ok = i2c_write_byte(bus_address << 1) && (reg16 ? i2c_write_byte(0x00) : true) &&
 	    i2c_write_byte(reg);
 	for (uint32_t i = 0; ok && i < length; i++) {
 		ok = i2c_write_byte(data[i]);
@@ -893,6 +899,65 @@ write_test(void)
 	}
 }
 
+/*
+ * Every protocol variant this chip could want, tried in one boot, printed one line each.
+ *
+ * One experiment per build was the wrong shape: each answer cost a rebuild, a download and a
+ * reboot, and the phone sat in the loader between them. Nothing here is destructive and every
+ * combination takes milliseconds, so they all go in one run: eight or sixteen bit register
+ * addressing, repeated start or stop-then-start, the two addresses the panel overlays name, and
+ * with or without Focaltech's 0x55/0xAA start sequence. What a working variant looks like is the
+ * chip ID at fts,x-max's driver registers -- 0x56 0x62 for the FT3680 family -- or at least a
+ * register map with structure in it instead of four bytes.
+ */
+static void
+sweep(void)
+{
+	static const uint8_t addresses[2] = { 0x49, 0x38 };
+
+	for (unsigned a = 0; a < 2; a++) {
+		for (unsigned r16 = 0; r16 < 2; r16++) {
+			for (unsigned nr = 0; nr < 2; nr++) {
+				for (unsigned st = 0; st < 2; st++) {
+					uint8_t idh = 0, idl = 0, boot[2] = { 0, 0 };
+					uint8_t probe_old = 0, probe_now = 0, five_a = 0x5a;
+					unsigned non_zero = 0;
+					bool stuck;
+
+					bus_address = addresses[a];
+					reg16 = r16 != 0;
+					norepeat = nr != 0;
+					if (st) {
+						uint8_t aa = FTS_CMD_START_VALUE;
+
+						(void)i2c_write_registers(FTS_CMD_START_REGISTER, &aa, 1);
+						sleep_ms(12);
+					}
+					(void)i2c_read_registers(FTS_CMD_BOOT_ID, boot, 2);
+					(void)i2c_read_registers(FTS_REG_CHIP_ID_HIGH, &idh, 1);
+					(void)i2c_read_registers(FTS_REG_CHIP_ID_LOW, &idl, 1);
+					for (unsigned reg = 0; reg < 256; reg++) {
+						uint8_t v = 0xff;
+
+						if (i2c_read_registers((uint8_t)reg, &v, 1) && v != 0x00) {
+							non_zero++;
+						}
+					}
+					(void)i2c_read_registers(0x50, &probe_old, 1);
+					(void)i2c_write_registers(0x50, &five_a, 1);
+					(void)i2c_read_registers(0x50, &probe_now, 1);
+					(void)i2c_write_registers(0x50, &probe_old, 1);
+					stuck = probe_now == five_a;
+					printf("umi_touch: sweep addr %#04x reg16 %u norepeat %u start %u:"
+					    " boot %02x %02x id %02x %02x, %u non-zero, write %s\n",
+					    addresses[a], r16, nr, st, boot[0], boot[1], idh, idl, non_zero,
+					    stuck ? "STUCK" : "ignored");
+				}
+			}
+		}
+	}
+}
+
 static void
 poll_report(void)
 {
@@ -1136,6 +1201,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t sup = 0;
 	uint32_t df = 0;
 	uint32_t wt = 0;
+	uint32_t sw = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -1165,6 +1231,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_diff", &df, sizeof(df));
 	PE_parse_boot_argn("umi_touch_wtest", &wt, sizeof(wt));
 	PE_parse_boot_argn("umi_touch_settle_ms", &settle_ms, sizeof(settle_ms));
+	PE_parse_boot_argn("umi_touch_sweep", &sw, sizeof(sw));
 	{
 		uint32_t r16 = 0;
 
@@ -1244,6 +1311,15 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	idle_looks = 80000 / poll_us;    /* a read every 80 ms even with the line high, in case it is missed */
 
+	if (sw) {
+		pins_for_i2c();
+		gpio_set(PIN_RESET, reset_mode != 0);
+		sleep_ms(settle_ms);
+		printf("umi_touch: sweeping every protocol variant this chip could want\n");
+		sweep();
+		thread_terminate(current_thread());
+		return;
+	}
 	if (wt) {
 		pins_for_i2c();
 		gpio_set(PIN_RESET, reset_mode != 0);
