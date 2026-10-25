@@ -881,8 +881,8 @@ fts_read_raw(uint8_t op, uint16_t address, uint8_t *data, uint32_t length)
 #define FLASH_DMA_CODE0           0x05
 #define FLASH_DMA_CODE1           0xC0
 #define FLASH_DMA_CONFIG          0x06
-#define FLASH_CHUNK               1024     /* bytes handed to one DMA burst */
-#define DMA_CHUNK                 32       /* bytes in one 0xF8 write */
+#define FLASH_CHUNK               (64 * 1024)   /* bytes handed to one DMA burst, ftsFlash.h */
+#define DMA_CHUNK                 (2 * 1024)    /* bytes in one 0xF8 write, ftsFlash.h */
 #define FLASH_RETRY               200
 #define FLASH_RETRY_MS            10
 #define FLASH_ADDR_CONFIG_WORDS   0x0000FC00   /* the loader addresses flash in 32-bit words */
@@ -1007,13 +1007,15 @@ flash_diagnostic(void)
 }
 
 /*
- * ftsFlash.c:fillFlash -- the bytes go in 32 at a time as 0xF8 <offset16> <data>, and then one
- * DMA command tells the loader to commit the whole 1 KB burst to flash at a word address.
+ * ftsFlash.c:fillFlash -- the bytes go in two kilobytes at a time as 0xF8 <offset16> <data>, and
+ * then one DMA command tells the loader to commit the whole 64 KB burst to flash at a word
+ * address. Both sizes are ftsFlash.h's FLASH_CHUNK and DMA_CHUNK, not guesses; the buffer is
+ * static because two kilobytes on this thread's stack is a quarter of it.
  */
 static bool
 flash_fill(uint32_t address_words, const uint8_t *data, uint32_t size)
 {
-	uint8_t buffer[3 + DMA_CHUNK];
+	static uint8_t buffer[3 + DMA_CHUNK];
 	uint32_t remaining = size;
 	uint32_t wheel = 0;
 
@@ -2766,7 +2768,13 @@ se_init_i2c(void)
 		return "the engine has no I2C firmware";
 	}
 	if (rd(GENI_IF_DISABLE_RO) & 1) {
-		return "the engine's FIFO interface is disabled";
+		/*
+		 * Not a refusal: QUALCOMM's own I2C driver never looks at this bit, and on a device
+		 * whose Android kernel drives I2C with GPI DMA the bootloader sets it, so the FIFO
+		 * interface is closed and the engine is meant to be fed through GSI instead. Whether
+		 * the FIFO still works underneath is worth one transfer rather than an assumption.
+		 */
+		printf("umi_touch: the engine reports its FIFO interface disabled; trying it anyway\n");
 	}
 	se_fifo_depth = rd(SE_HW_PARAM_0) >> 16 & 0x3f;
 	if (se_fifo_depth < 4) {
@@ -2925,6 +2933,12 @@ hw_i2c_probe(void)
 	gpio_configure(PIN_SCL, 1, PULL_UP, 2, false);
 	printf("umi_touch: gpio%u muxed to %#x, gpio%u muxed to %#x\n", PIN_SDA,
 	    rd(GPIO_CFG(PIN_SDA)), PIN_SCL, rd(GPIO_CFG(PIN_SCL)));
+	printf("umi_touch: engine depth %u words, fifo disabled %#x, output ctrl %#x, dma mode %#x, byte gran %#x\n",
+	    se_fifo_depth, rd(GENI_IF_DISABLE_RO), rd(GENI_OUTPUT_CTRL), rd(GENI_DMA_MODE_EN),
+	    rd(GENI_BYTE_GRAN));
+	/* one clock and one data line high is the idle state of an I2C bus: IOS says what it sees */
+	printf("umi_touch: bus idle? ios %#x (bit 0 data, bit 1 clock), status %#x\n", rd(SE_GENI_IOS),
+	    rd(GENI_STATUS));
 
 	for (unsigned variant = 0; variant < 2; variant++) {
 		uint8_t id[2] = { 0, 0 };
@@ -2939,6 +2953,9 @@ hw_i2c_probe(void)
 		printf("umi_touch: %u %-15s 0000: %s %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		    variant, framing[variant], ok ? "read" : "fail", page[0], page[1], page[2],
 		    page[3], page[4], page[5], page[6], page[7]);
+		printf("umi_touch: %u after: cmd0 %#x irq %#x status %#x ios %#x tx fifo %#x rx fifo %#x\n",
+		    variant, rd(GENI_M_CMD0), rd(GENI_M_IRQ_STATUS), rd(GENI_STATUS), rd(SE_GENI_IOS),
+		    rd(GENI_TX_FIFO_STATUS), rd(GENI_RX_FIFO_STATUS));
 	}
 	{
 		uint8_t version[2] = { 0, 0 };
