@@ -18,8 +18,8 @@
  *            fts,reset-gpio = <gpio38 0>, fts,irq-gpio = <gpio39 0x2008>.
  *   power    avdd-supply -> touch_vddio_vreg ("disp_vddio_vreg"), a regulator-fixed whose
  *            enable is gpio69 and which is active high. It is the panel's I/O rail: on
- *            already, because the display is lit. The driver only looks at it (umi_touch_avdd=1
- *            also drives it high) rather than assuming.
+ *            already, because the display is lit. The driver leaves it alone unless asked
+ *            (umi_touch_avdd=1 reads it and drives it high) rather than assuming.
  *   panel    fts,x-max 1080, fts,y-max 2340, focaltech,max-touch-number 10.
  *
  * The serial engine itself is not used. Its I2C protocol firmware is loaded by whoever
@@ -41,7 +41,11 @@
  *                       gpio36/gpio37 is SDA and which is SCL)
  *   umi_touch_poll_us=N look at the interrupt line every N microseconds (8000 otherwise)
  *   umi_touch_flip=N    1 mirror left-right, 2 top-bottom, 3 both
- *   umi_touch_avdd=1    drive the panel I/O rail's enable (gpio69) high before anything else
+ *   umi_touch_avdd=1    read the panel I/O rail's enable (gpio69) and drive it high before
+ *                       anything else
+ *   umi_touch_stage=N   stop early and say so: 1 read the pins and nothing else, 2 also reset
+ *                       the chip and read its ID, 9 (the default) run the polling loop
+ *   umi_touch_gpio=0xN  put every pin at N + 0x1000 * pin, over the tile table below
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -56,10 +60,42 @@ extern kern_return_t thread_terminate(thread_t thread);
 
 /* ---- pins (TLMM) ------------------------------------------------------------------------------- */
 
-#define TLMM_PHYS                0x0f100000UL
+/*
+ * The GPIO registers are not where soc/pinctrl@f000000 says they are. That node is
+ * reg = <0x0f000000 0x1000000>, one window over three separate register tiles, which this
+ * port's own platform memory map names (uefi/files/Platforms/Xiaomi/umiPkg/Library/
+ * MemoryMapLib/MemoryMapLib.c):
+ *
+ *   TLMM_WEST   0x0f100000  0x300000
+ *   TLMM_SOUTH  0x0f500000  0x300000
+ *   TLMM_NORTH  0x0f900000  0x300000
+ *
+ * A pin's control register is its tile's base plus 0x1000 per pin number, and which tile a
+ * pin is in is not "the low ones west, the high ones north" -- it interleaves. The table in
+ * gpio_tile() below is not a guess: it was read out of the pin table in the phone's own
+ * Android kernel, a 180-entry array of {ctl, io, intr_cfg, intr_status, intr_target} at an
+ * 80-byte stride, every entry satisfying io == ctl + 4, intr_cfg == ctl + 8,
+ * intr_status == ctl + 0xc, with ctl == tile + 0x1000 * pin.
+ *
+ * Getting it wrong is not a wrong reading, it is a dead phone: the computed address lands in
+ * a hole the tile does not decode, the access raises a synchronous external abort, and the
+ * machine goes down before a single printf reaches the loader's log. That is what
+ * 0x0f100000 + 0x1000 * 36 = 0x0f124000 did -- TLMM_WEST's first implemented pin is
+ * 0x0f185000 (gpio133) -- and why every earlier attempt at this driver, and
+ * redwood_goodix.c, whose pins 52 to 55 and 105 to 107 land in the same hole, hung with
+ * nothing on the wire. The POCO X5 Pro that driver was written for (yupik) has one tile at
+ * 0x0f100000 and never meets this.
+ *
+ * All five pins this driver uses -- 36, 37, 38, 39 and 69 -- are in TLMM_SOUTH:
+ * gpio36 at 0x0f524000, gpio39 at 0x0f527000, gpio69 at 0x0f545000.
+ */
+#define TLMM_WEST                0x0f100000UL
+#define TLMM_SOUTH               0x0f500000UL
+#define TLMM_NORTH               0x0f900000UL
 #define TLMM_SIZE                0x100000UL
-#define GPIO_CFG(n)              (tlmm + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
-#define GPIO_IO(n)               (tlmm + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
+
+#define GPIO_CFG(n)              (gpio_tile(n) + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
+#define GPIO_IO(n)               (gpio_tile(n) + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define PULL_NONE                0
 #define PULL_UP                  3
 
@@ -81,7 +117,52 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define FTS_EVENT_UP             1
 #define FTS_EVENT_CONTACT        2
 
-static vm_offset_t tlmm;
+static vm_offset_t tlmm_west, tlmm_south, tlmm_north;
+static vm_offset_t tlmm_one;            /* umi_touch_gpio: put every pin at this base instead */
+static uint32_t stage = 9;              /* umi_touch_stage */
+
+/* Which tile a pin's registers live in, out of the table described above. */
+static vm_offset_t
+gpio_tile(unsigned pin)
+{
+	if (tlmm_one) {
+		return tlmm_one;
+	}
+	if (pin <= 3) {
+		return tlmm_south;
+	}
+	if (pin <= 23) {
+		return tlmm_north;
+	}
+	if (pin <= 27) {
+		return tlmm_south;
+	}
+	if (pin <= 31) {
+		return tlmm_north;
+	}
+	if (pin <= 65) {
+		return tlmm_south;
+	}
+	if (pin <= 68) {
+		return tlmm_north;
+	}
+	if (pin <= 76) {
+		return tlmm_south;
+	}
+	if (pin <= 84) {
+		return tlmm_north;
+	}
+	if (pin <= 91) {
+		return tlmm_south;
+	}
+	if (pin <= 124) {
+		return tlmm_north;
+	}
+	if (pin <= 132) {
+		return tlmm_south;
+	}
+	return tlmm_west;               /* 133 .. 179 */
+}
 
 static inline uint32_t
 rd(vm_offset_t address)
@@ -136,10 +217,9 @@ gpio_output(unsigned pin, bool high, unsigned pull, unsigned ma)
 static void
 show_pins(const char *when)
 {
-	printf("umi_touch: %s: tlmm sda %#x/%u scl %#x/%u reset %#x/%u int %#x/%u avdd %#x/%u\n", when,
+	printf("umi_touch: %s: tlmm sda %#x/%u scl %#x/%u reset %#x/%u int %#x/%u\n", when,
 	    rd(GPIO_CFG(PIN_SDA)), gpio_get(PIN_SDA), rd(GPIO_CFG(PIN_SCL)), gpio_get(PIN_SCL),
-	    rd(GPIO_CFG(PIN_RESET)), gpio_get(PIN_RESET), rd(GPIO_CFG(PIN_INT)), gpio_get(PIN_INT),
-	    rd(GPIO_CFG(PIN_AVDD)), gpio_get(PIN_AVDD));
+	    rd(GPIO_CFG(PIN_RESET)), gpio_get(PIN_RESET), rd(GPIO_CFG(PIN_INT)), gpio_get(PIN_INT));
 }
 
 /* ---- I2C by hand -------------------------------------------------------------------------------- */
@@ -505,7 +585,7 @@ poll_report(void)
 static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, reg = 0;
+	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, reg = 0, one = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -515,6 +595,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_swap", &swap, sizeof(swap));
 	PE_parse_boot_argn("umi_touch_reg", &reg, sizeof(reg));
 	PE_parse_boot_argn("umi_touch_flip", &flip, sizeof(flip));
+	PE_parse_boot_argn("umi_touch_stage", &stage, sizeof(stage));
+	PE_parse_boot_argn("umi_touch_gpio", &one, sizeof(one));
 	if (poll_us < 250 || poll_us > 100000) {
 		poll_us = 8000;
 	}
@@ -522,13 +604,29 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		touch_register = reg;
 	}
 
-	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+	tlmm_west = ml_io_map(TLMM_WEST, TLMM_SIZE);
+	tlmm_south = ml_io_map(TLMM_SOUTH, TLMM_SIZE);
+	tlmm_north = ml_io_map(TLMM_NORTH, TLMM_SIZE);
+	if (one) {
+		printf("umi_touch: every pin at %#x + 0x1000 * pin, over the tile table\n", one);
+		tlmm_one = ml_io_map(one, TLMM_SIZE);
+	}
+	printf("umi_touch: tlmm west %#x south %#x north %#x; gpio%u..%u and gpio%u are in south\n",
+	    (uint32_t)TLMM_WEST, (uint32_t)TLMM_SOUTH, (uint32_t)TLMM_NORTH, PIN_SDA, PIN_INT, PIN_AVDD);
+
 	show_pins("as found");
+	if (stage <= 1) {
+		printf("umi_touch: stage %u -- the pins were read and nothing was written; stopping\n", stage);
+		thread_terminate(current_thread());
+		return;
+	}
 	if (avdd) {
-		printf("umi_touch: driving the panel I/O rail's enable (gpio%u) high\n", PIN_AVDD);
+		printf("umi_touch: gpio%u, the panel I/O rail's enable, is %#x/%u; driving it high\n",
+		    PIN_AVDD, rd(GPIO_CFG(PIN_AVDD)), gpio_get(PIN_AVDD));
 		gpio_output(PIN_AVDD, true, PULL_NONE, 2);
 		sleep_ms(5);
-		show_pins("with the I/O rail's enable driven");
+		printf("umi_touch: gpio%u is now %#x/%u\n",
+		    PIN_AVDD, rd(GPIO_CFG(PIN_AVDD)), gpio_get(PIN_AVDD));
 	}
 	idle_looks = 80000 / poll_us;    /* a read every 80 ms even with the line high, in case it is missed */
 
@@ -547,6 +645,12 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 			scl = t;
 		}
 		found = probe(sda, scl, true);
+	}
+	if (stage <= 2) {
+		printf("umi_touch: stage %u -- the chip %s; stopping\n", stage,
+		    found ? "answered" : "did not answer");
+		thread_terminate(current_thread());
+		return;
 	}
 	if (!found) {
 		printf("umi_touch: no FocalTech touch screen on I2C %#x\n", I2C_ADDRESS);
