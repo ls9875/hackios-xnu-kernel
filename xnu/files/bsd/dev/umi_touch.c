@@ -2695,6 +2695,10 @@ se_map(void)
 static void
 se_dump(const char *when)
 {
+	if (!gcc_base || !se_base) {
+		printf("umi_touch: [%s] the engine is not mapped yet\n", when);
+		return;
+	}
 	printf("umi_touch: [%s] votes %#x core %#x core2x %#x se5 %#x\n", when,
 	    rd(GCC_QUP_VOTE), rd(GCC_QUP1_CORE_CBCR), rd(GCC_QUP1_CORE2X_CBCR), rd(GCC_QUP1_SE5_CBCR));
 	printf("umi_touch: [%s] rcg cmd %#x cfg %#x dfs %#x | fw revision %#x (protocol %u) if disable %#x hw param0 %#x\n",
@@ -2918,6 +2922,9 @@ hw_i2c_probe(void)
 	const char *why;
 
 	printf("umi_touch: --- the serial engine at %#x as an I2C master ---\n", (uint32_t)SE_PHYS);
+	if (!se_map()) {
+		return;
+	}
 	se_dump("before");
 	why = se_init_i2c();
 	printf("umi_touch: engine setup: %s\n", why ? why : "ok");
