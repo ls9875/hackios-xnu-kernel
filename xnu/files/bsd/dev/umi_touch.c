@@ -620,6 +620,89 @@ fts_read_registers(uint16_t address, uint8_t *data, uint32_t length)
 }
 
 /*
+ * The same read with an 8-bit register address: {0xB6, reg}, repeated start, dummy, data.
+ *
+ * That is what this driver did before the vendor source was read, and the sweep that replaced it
+ * recorded one thing the 16-bit model cannot explain: an 8-bit walk of 0x00..0xFF found four
+ * registers that were not zero, while every 16-bit walk of the same range finds none. Four is
+ * either the tail of a real answer or four bytes of noise, and a count cannot tell the two apart.
+ * This walks the range again and prints the addresses, which is the part the count threw away.
+ */
+static bool
+fts_read_reg8(uint8_t reg, uint8_t *data, uint32_t length)
+{
+	uint8_t buf[FTS_FIFO_DEPTH + 1];
+	bool ok = false;
+
+	if (length > sizeof(buf) - 1) {
+		return false;
+	}
+	i2c_start();
+	if (i2c_write_byte((uint8_t)(bus_address << 1)) &&
+	    i2c_write_byte(FTS_CMD_HW_REG) &&
+	    i2c_write_byte(reg)) {
+		i2c_start();
+		if (i2c_write_byte((uint8_t)(bus_address << 1 | 1))) {
+			for (uint32_t i = 0; i <= length; i++) {
+				buf[i] = i2c_read_byte(i < length);
+			}
+			memcpy(data, buf + 1, length);
+			ok = true;
+		}
+	}
+	i2c_stop();
+	return ok;
+}
+
+/*
+ * Where in the address space, if anywhere, does this part answer with something other than zero?
+ *
+ * "The register file is not there" has been the reading of every run so far, and it rests on one
+ * range: 0x0000..0x00ff. That is 256 of 65536 addresses, chosen because it is where the vendor
+ * header puts the id. If the file is elsewhere -- a page register, a window at 0x2000 where the
+ * command and the fifo live -- then the chip has been answering all along and the map was wrong,
+ * which is a completely different problem from a core that is not running. So: eight-bit and
+ * sixteen-bit walks of the id page, then the rest of the space a window at a time, and any byte
+ * that is not zero is printed with the address it came from.
+ */
+static void
+register_scan(void)
+{
+	static const uint16_t windows[] = { 0x0000, 0x0100, 0x0200, 0x2000, 0x2100, 0x3000, 0xc000, 0xe000 };
+	uint8_t value;
+	unsigned hits;
+
+	printf("umi_touch: --- eight-bit walk of 0x00..0xff, non-zero addresses only ---\n");
+	hits = 0;
+	for (unsigned reg = 0; reg < 0x100; reg++) {
+		value = 0;
+		if (!fts_read_reg8((uint8_t)reg, &value, 1)) {
+			continue;
+		}
+		if (value != 0) {
+			printf("umi_touch:   8-bit %02x = %02x\n", reg, value);
+			hits++;
+		}
+	}
+	printf("umi_touch:   8-bit: %u of 256 not zero\n", hits);
+
+	for (unsigned w = 0; w < sizeof(windows) / sizeof(windows[0]); w++) {
+		hits = 0;
+		for (unsigned off = 0; off < 0x100; off++) {
+			value = 0;
+			if (!fts_read_registers((uint16_t)(windows[w] + off), &value, 1)) {
+				continue;
+			}
+			if (value != 0) {
+				printf("umi_touch:   16-bit %04x = %02x\n", windows[w] + off, value);
+				hits++;
+			}
+		}
+		printf("umi_touch:   16-bit window %04x: %u of 256 not zero\n", windows[w], hits);
+	}
+}
+
+/*
  * The same read with the opcode spelled out.
  *
  * Every other function in here assumes 0xB6 is the opcode that means "hardware register", because
@@ -1864,13 +1947,22 @@ power_up(void)
 		{ PIN_VBOOST, "gpio5, vdd_boost_vreg", 6 },     /* startup-delay-us 4000 */
 		{ PIN_VCI,    "gpio71, display_panel_vci", 2 }, /* 3.0 V, boot-on */
 	};
+	uint32_t v5 = 0;
 	/*
-	 * ext_5v_boost (gpio12) is deliberately not driven. It is the third rail in the same fragment
-	 * and it is the only other candidate, but the base tree gives it to qcom,usb-pdphy as
-	 * vbus-supply: it is the otg 5 V, and switching it on while this kernel is talking to the
-	 * loader over that same usb port is a good way to lose the log that says what happened. If the
-	 * two below are not it, that one is next, with the run's output already captured.
+	 * ext_5v_boost (gpio12) is the third rail in the same fragment and the last one this driver
+	 * has not driven. It stays behind umi_touch_v5=1 because the base tree gives it to
+	 * qcom,usb-pdphy as vbus-supply: it is the otg 5 V, and switching it on while this kernel is
+	 * talking to the loader over that same usb port is a good way to lose the log that says what
+	 * happened. It is worth the risk now that the other two are measured: both were already high
+	 * before the driver touched them, so "enable the rail" never changed a thing, and a load
+	 * switch whose enable is high proves nothing about the rail behind it. If the display tree is
+	 * fed from here, gpio5 and gpio71 being high has meant nothing at all, which would be the one
+	 * power explanation the id reads so far cannot see.
 	 */
+	PE_parse_boot_argn("umi_touch_v5", &v5, sizeof(v5));
+	if (v5) {
+		printf("umi_touch: power: umi_touch_v5=1 -- driving gpio12 (ext_5v_boost), the usb 5 V\n");
+	}
 
 	line_release(pin_sda);
 	line_release(pin_scl);
@@ -1904,6 +1996,16 @@ power_up(void)
 		power_id(rails[i].what);
 	}
 
+	if (v5) {
+		printf("umi_touch: power: gpio%u ext_5v_boost %#x/%u -> high\n", PIN_V5,
+		    rd(GPIO_CFG(PIN_V5)), gpio_get(PIN_V5));
+		gpio_output(PIN_V5, true, PULL_NONE, 8);
+		sleep_ms(10);                   /* enable-ramp-delay 1600 us, then the tree comes up */
+		power_id("gpio12, ext_5v_boost");
+		sleep_ms(50);
+		power_id("gpio12, 50 ms later");
+	}
+
 	gpio_output(PIN_RESET, false, PULL_NONE, 2);
 	sleep_ms(20);
 	gpio_output(PIN_RESET, true, PULL_NONE, 2);
@@ -1925,6 +2027,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t pc = 0;
 	uint32_t proto = 0;
 	uint32_t bitsweep = 0;
+	uint32_t scan8 = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -1951,6 +2054,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_pcycle", &pc, sizeof(pc));
 	PE_parse_boot_argn("umi_touch_proto", &proto, sizeof(proto));
 	PE_parse_boot_argn("umi_touch_bitsweep", &bitsweep, sizeof(bitsweep));
+	PE_parse_boot_argn("umi_touch_scan8", &scan8, sizeof(scan8));
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
@@ -1981,8 +2085,19 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * from and gpio69 the switch the fts node names, and the part still does not run on those two
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
-	if (sup || proto || bitsweep) {
+	if (sup || proto || bitsweep || scan8) {
 		power_up();
+	}
+	/*
+	 * umi_touch_scan8=1: which addresses, anywhere in the space, answer with something other
+	 * than zero. See register_scan() -- the id page has been the only range measured, and a
+	 * register file in a different window would look exactly like a core that is not running.
+	 */
+	if (scan8) {
+		i2c_bus_recover();
+		register_scan();
+		thread_terminate(current_thread());
+		return;
 	}
 	/*
 	 * umi_touch_proto=1: the chip acknowledges its address and returns zero for every register.
