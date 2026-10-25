@@ -2851,6 +2851,122 @@ rom_scan(void)
 	}
 }
 
+/*
+ * Nine clocks with the data line let go, which is how a slave that is waiting for the rest of a
+ * byte is told to forget it. The clear in i2c_bus_recover() never runs when both lines read high,
+ * and with ldoc1 on they always do, so this is the first one that is unconditional.
+ */
+static void
+clock_clear(unsigned pulses)
+{
+	line_release(pin_sda);
+	for (unsigned i = 0; i < pulses; i++) {
+		scl_high();
+		i2c_delay();
+		line_low(pin_scl);
+		i2c_delay();
+	}
+	i2c_stop();
+}
+
+/*
+ * umi_touch_rescue=1: drop the supply for real, and clock the bus clear for real.
+ *
+ * recover_sweep() held the reset line in ten orders and dropped gpio69, gpio5 and gpio71, but it
+ * never dropped ldoc1 -- and ldoc1 is the 1.8 V this pair hangs from: sda and scl go from 0 to 1
+ * the instant RPMh is asked for it, which is the whole reason that rail was found. A "power cycle"
+ * that leaves the chip's own supply up resets nothing, so the one test that could take a hung core
+ * out of its state has never actually been run.
+ *
+ * Nor has a real clear. i2c_bus_recover() gives up immediately when both lines read high, and with
+ * ldoc1 on both of them do, so the nine clocks have never been sent either.
+ *
+ * Both are worth one run now, because the answers this part gives are specific rather than vague.
+ * Every address acknowledges -- 256 of 256 -- the loader's 256 register types answer zero under a
+ * repeated start and again across a stop, a read with no command byte in it answers zero too, and
+ * the event fifo answers zero. A chip with no application would still have to serve its own boot
+ * rom correctly; a slave that is stuck part way through a byte holds SDA down and produces exactly
+ * this: an acknowledge on every byte and a zero on every bit.
+ */
+static void
+rescue_sweep(void)
+{
+	uint32_t base = rpmh_address("ldoc1");
+	uint32_t address[1];
+	uint32_t data[1];
+	uint8_t reset_cmd[4] = { FTS_CMD_HW_REG, 0x00, 0x28, 0x80 };
+	uint8_t warm[4] = { FTS_CMD_HW_REG, (uint8_t)(ADDR_WARM_BOOT >> 8),
+		            (uint8_t)(ADDR_WARM_BOOT & 0xff), WARM_BOOT_VALUE };
+
+	printf("umi_touch: --- rescue: drop the rails for real, then clear the bus for real ---\n");
+
+	/* 1. everything off, in the reverse of the order it is turned on */
+	printf("umi_touch: rescue: 1) rails off\n");
+	gpio_output(PIN_RESET, false, PULL_NONE, 2);
+	gpio_output(PIN_AVDD, false, PULL_DOWN, 2);
+	gpio_output(PIN_VBOOST, false, PULL_DOWN, 2);
+	gpio_output(PIN_VCI, false, PULL_DOWN, 2);
+	if (base != 0) {
+		address[0] = base + VRM_ENABLE;
+		data[0] = 0;
+		printf("umi_touch: rescue: ldoc1 off: %s\n",
+		    rpmh_write(address, data, 1) ? "asked for" : "refused");
+	} else {
+		printf("umi_touch: rescue: rpmh has no ldoc1, so the supply cannot be dropped\n");
+	}
+	printf("umi_touch: rescue: held off for two seconds\n");
+	sleep_ms(2000);
+	printf("umi_touch: rescue: while off: sda %u scl %u int %u\n",
+	    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_INT));
+
+	/* 2. back up in Android's order: the 1.8 V, then the switch, then out of reset */
+	printf("umi_touch: rescue: 2) rails on\n");
+	if (base != 0) {
+		address[0] = base + VRM_ENABLE;
+		data[0] = 1;
+		rpmh_write(address, data, 1);
+	}
+	sleep_ms(200);
+	printf("umi_touch: rescue: with ldoc1 on: sda %u scl %u reset %u int %u\n",
+	    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_RESET), gpio_get(PIN_INT));
+	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	sleep_ms(200);
+	gpio_output(PIN_RESET, true, PULL_NONE, 2);
+	sleep_ms(300);
+	recover_page("after a real power cycle");
+
+	/* 3. the clear, at four lengths, with nothing else in between */
+	for (unsigned pulses = 9; pulses <= 72; pulses *= 2) {
+		printf("umi_touch: rescue: 3) %u clock pulses\n", pulses);
+		clock_clear(pulses);
+		recover_page("after the clocks");
+	}
+
+	/* 4. the same clear with the chip held in reset: reset may not reach the slave, and clocks
+	 * may not reach the core, but between them they cover both */
+	printf("umi_touch: rescue: 4) cleared while held in reset\n");
+	gpio_output(PIN_RESET, false, PULL_NONE, 2);
+	sleep_ms(20);
+	clock_clear(18);
+	sleep_ms(20);
+	gpio_output(PIN_RESET, true, PULL_NONE, 2);
+	sleep_ms(300);
+	recover_page("after a clear in reset");
+
+	/* 5. and the two commands that would take a listening rom out of itself */
+	printf("umi_touch: rescue: 5) the commands that leave the rom\n");
+	printf("umi_touch: rescue: system reset 0x0028 <- 0x80: %s\n",
+	    fts_write_bytes(reset_cmd, sizeof(reset_cmd)) ? "acknowledged" : "not acknowledged");
+	sleep_ms(150);
+	recover_page("after an application system reset");
+	printf("umi_touch: rescue: warm boot 0x001e <- 0x38: %s\n",
+	    fts_write_bytes(warm, sizeof(warm)) ? "acknowledged" : "not acknowledged");
+	sleep_ms(300);
+	recover_page("after a warm boot");
+
+	printf("umi_touch: rescue: done\n");
+}
+
 /* The interrupt line read as an input with its pull-up on: only the chip can pull it low. */
 static bool
 int_line(void){
@@ -3427,6 +3543,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t quietarg = 0;
 	uint32_t fullarg = 0;
 	uint32_t romarg = 0;
+	uint32_t rescuearg = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -3466,6 +3583,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_quiet", &quietarg, sizeof(quietarg));
 	PE_parse_boot_argn("umi_touch_fullscan", &fullarg, sizeof(fullarg));
 	PE_parse_boot_argn("umi_touch_romscan", &romarg, sizeof(romarg));
+	PE_parse_boot_argn("umi_touch_rescue", &rescuearg, sizeof(rescuearg));
 	/*
 	 * umi_touch_pinswap=1: the two lines the other way round, for every path in this file.
 	 *
@@ -3537,7 +3655,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
 	if (sup || proto || bitsweep || scan8 || intmon || flasharg || burnarg ||
-	    eventsarg || shapesarg || searg || hwi2carg || recoverarg || fullarg || romarg) {
+	    eventsarg || shapesarg || searg || hwi2carg || recoverarg || fullarg || romarg || rescuearg) {
 		power_up();
 	}
 	/*
@@ -3625,6 +3743,16 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	if (romarg) {
 		i2c_bus_recover();
 		rom_scan();
+		thread_terminate(current_thread());
+		return;
+	}
+	/*
+	 * umi_touch_rescue=1: see rescue_sweep(). The two things recover_sweep() never did -- drop
+	 * ldoc1, which is the only rail that actually reaches this chip, and send the nine clocks
+	 * that take a slave out of a half-finished byte, which the idle-bus check always skipped.
+	 */
+	if (rescuearg) {
+		rescue_sweep();
 		thread_terminate(current_thread());
 		return;
 	}
