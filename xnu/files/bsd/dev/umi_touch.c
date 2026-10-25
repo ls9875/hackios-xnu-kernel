@@ -1924,6 +1924,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t sw = 0;
 	uint32_t pc = 0;
 	uint32_t proto = 0;
+	uint32_t bitsweep = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -1949,6 +1950,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_sweep", &sw, sizeof(sw));
 	PE_parse_boot_argn("umi_touch_pcycle", &pc, sizeof(pc));
 	PE_parse_boot_argn("umi_touch_proto", &proto, sizeof(proto));
+	PE_parse_boot_argn("umi_touch_bitsweep", &bitsweep, sizeof(bitsweep));
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
@@ -1979,7 +1981,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * from and gpio69 the switch the fts node names, and the part still does not run on those two
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
-	if (sup || proto) {
+	if (sup || proto || bitsweep) {
 		power_up();
 	}
 	/*
@@ -1993,6 +1995,33 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		printf("umi_touch: the pair before the scan: sda %u scl %u int %u\n",
 		    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_INT));
 		protocol_scan();
+		thread_terminate(current_thread());
+		return;
+	}
+	/*
+	 * umi_touch_bitsweep=1: the one variable no run has swept. Every reading this driver has
+	 * taken so far was at bit_us=3, and the part has answered its address at that rate and
+	 * returned zeros for everything else. A half-period the chip cannot follow -- or one long
+	 * enough that its own timeout fires part-way through a transfer -- looks exactly like a
+	 * part that is not running, and it is the last thing left that can make a live chip look
+	 * dead. So: read the id at each half-period, slowest first, recovering the bus before
+	 * each one so that a rate which stalls does not poison the next.
+	 */
+	if (bitsweep) {
+		static const unsigned rates[] = { 100, 50, 25, 12, 6, 3, 1 };
+
+		printf("umi_touch: --- bit rate sweep: the id at each half-period ---\n");
+		for (unsigned i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+			uint8_t id[2] = { 0, 0 };
+			bool ok;
+
+			bit_us = rates[i];
+			i2c_bus_recover();
+			ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+			printf("umi_touch: bit_us %3u: %-4s id %02x %02x%s\n", rates[i],
+			    ok ? "read" : "fail", id[0], id[1],
+			    (id[0] || id[1]) ? "   <- not zero" : "");
+		}
 		thread_terminate(current_thread());
 		return;
 	}
