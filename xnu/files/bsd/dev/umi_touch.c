@@ -449,15 +449,40 @@ i2c_delay(void)
  * the map this one gave: four non-zero bytes out of 256, unchanged at 5 kHz, on a bus that
  * acknowledges its address perfectly well.
  */
+/*
+ * How long one clock is given to go high, and what the clocks actually did.
+ *
+ * A slave that is not ready holds SCL down -- clock stretching -- and this used to read straight
+ * through that. The allowance is four milliseconds, which is far more than a part that has the
+ * byte ready needs and far less than a part that is stuck will ever take, so a run that counts
+ * the clocks which timed out can tell "the slave asked for time and got it" from "the slave never
+ * let go". umi_touch_stretch=1 raises the allowance to half a second and prints the tally.
+ */
+static unsigned scl_limit_us = 4000;
+static bool stretch_watch;
+static unsigned stretch_slow;
+static uint64_t stretch_longest;
+
 static void
 scl_high(void)
 {
 	uint64_t deadline;
+	uint64_t began = stretch_watch ? mach_absolute_time() : 0;
 
 	line_release(pin_scl);
-	clock_interval_to_deadline(4000, NSEC_PER_USEC, &deadline);     /* 4 ms of wall time, at most */
+	clock_interval_to_deadline(scl_limit_us, NSEC_PER_USEC, &deadline);
 	while (!gpio_get(pin_scl) && mach_absolute_time() < deadline) {
 		/* the slave is holding SCL down; that is it asking for time, so give it */
+	}
+	if (stretch_watch) {
+		uint64_t waited = mach_absolute_time() - began;
+
+		if (!gpio_get(pin_scl)) {
+			stretch_slow++;
+		}
+		if (waited > stretch_longest) {
+			stretch_longest = waited;
+		}
 	}
 }
 
@@ -2724,7 +2749,7 @@ full_scan(void)
 	uint64_t elapsed = mach_absolute_time() - began;
 
 	printf("umi_touch: fullscan: %u non-zero byte%s in 65536 addresses, %llu ticks\n",
-	    found, found == 1 ? "" : "s", elapsed);
+	    found, found == 1 ? "" : "s", (unsigned long long)elapsed);
 	if (found > printed) {
 		printf("umi_touch: fullscan: %u more not printed\n", found - printed);
 	}
@@ -2965,6 +2990,73 @@ rescue_sweep(void)
 	recover_page("after a warm boot");
 
 	printf("umi_touch: rescue: done\n");
+}
+
+/*
+ * umi_touch_stretch=1: how long does this part hold the clock down?
+ *
+ * A genuine cold power cycle is now on record -- ldoc1 dropped until sda and scl fell to zero,
+ * held off two seconds, brought back in Android's order -- and the register file still reads zero
+ * at every address. But the interrupt line separates the two remaining explanations: while the
+ * chip is held in reset it reads 1, and once the reset is released it reads 0, so the part is
+ * driving that line itself and has something to say. A part with something to say is not an idle
+ * part, and an i2c slave with a byte to give but no way to give it stretches the clock.
+ *
+ * Four milliseconds is the allowance every read has ever been given. This raises it to half a
+ * second, which is longer than any part needs to produce a byte, and counts the clocks that still
+ * timed out. If the count turns over from "all of them" to "none", stretching was the mechanism
+ * and the answer was there all along. If every clock in every read still times out at half a
+ * second, the slave is not asking for time -- it is simply not answering, and no framing, rate or
+ * reset order on this side will change that.
+ */
+static void
+stretch_probe(void)
+{
+	uint8_t id[2];
+	uint8_t page[8];
+	bool ok;
+
+	printf("umi_touch: --- clock stretching, measured ---\n");
+
+	for (unsigned round = 0; round < 2; round++) {
+		stretch_slow = 0;
+		stretch_longest = 0;
+		scl_limit_us = 4000;
+		id[0] = id[1] = 0;
+		stretch_watch = true;
+		ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+		stretch_watch = false;
+		printf("umi_touch: stretch: 4 ms: %s, id %02x %02x, %u clocks did not go high, "
+		    "longest wait %llu ticks\n",
+		    ok ? "read" : "fail", id[0], id[1], stretch_slow, (unsigned long long)stretch_longest);
+	}
+
+	stretch_slow = 0;
+	stretch_longest = 0;
+	scl_limit_us = 500000;
+	id[0] = id[1] = 0;
+	stretch_watch = true;
+	ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+	stretch_watch = false;
+	printf("umi_touch: stretch: 500 ms: %s, id %02x %02x, %u clocks did not go high, "
+	    "longest wait %llu ticks\n",
+	    ok ? "read" : "fail", id[0], id[1], stretch_slow, (unsigned long long)stretch_longest);
+
+	for (unsigned i = 0; i < sizeof(page); i++) {
+		page[i] = 0;
+	}
+	stretch_slow = 0;
+	stretch_longest = 0;
+	stretch_watch = true;
+	ok = fts_read_registers(0x0000, page, sizeof(page));
+	stretch_watch = false;
+	printf("umi_touch: stretch: 500 ms, page 0000: %s, %02x %02x %02x %02x %02x %02x %02x %02x, "
+	    "%u clocks did not go high, longest wait %llu ticks\n",
+	    ok ? "read" : "fail", page[0], page[1], page[2], page[3], page[4], page[5], page[6], page[7],
+	    stretch_slow, (unsigned long long)stretch_longest);
+
+	scl_limit_us = 4000;
+	printf("umi_touch: stretch: done\n");
 }
 
 /* The interrupt line read as an input with its pull-up on: only the chip can pull it low. */
@@ -3544,6 +3636,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t fullarg = 0;
 	uint32_t romarg = 0;
 	uint32_t rescuearg = 0;
+	uint32_t stretcharg = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -3584,6 +3677,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_fullscan", &fullarg, sizeof(fullarg));
 	PE_parse_boot_argn("umi_touch_romscan", &romarg, sizeof(romarg));
 	PE_parse_boot_argn("umi_touch_rescue", &rescuearg, sizeof(rescuearg));
+	PE_parse_boot_argn("umi_touch_stretch", &stretcharg, sizeof(stretcharg));
 	/*
 	 * umi_touch_pinswap=1: the two lines the other way round, for every path in this file.
 	 *
@@ -3655,7 +3749,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
 	if (sup || proto || bitsweep || scan8 || intmon || flasharg || burnarg ||
-	    eventsarg || shapesarg || searg || hwi2carg || recoverarg || fullarg || romarg || rescuearg) {
+	    eventsarg || shapesarg || searg || hwi2carg || recoverarg || fullarg || romarg || rescuearg || stretcharg) {
 		power_up();
 	}
 	/*
@@ -3753,6 +3847,16 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 */
 	if (rescuearg) {
 		rescue_sweep();
+		thread_terminate(current_thread());
+		return;
+	}
+	/*
+	 * umi_touch_stretch=1: see stretch_probe(). The clock allowance every read has ever been
+	 * given is four milliseconds; this raises it to half a second and counts what still times
+	 * out, which decides whether the part is asking for time or simply not answering.
+	 */
+	if (stretcharg) {
+		stretch_probe();
 		thread_terminate(current_thread());
 		return;
 	}
