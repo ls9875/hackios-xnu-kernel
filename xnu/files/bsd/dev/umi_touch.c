@@ -643,6 +643,82 @@ fts_read_registers(uint16_t address, uint8_t *data, uint32_t length)
 }
 
 /*
+ * umi_touch_shapes=1: the same register read with four wire shapes.
+ *
+ * The part acknowledges every byte and answers zero, at every rate, for every address, for the
+ * application's read command and the loader's status read alike. Three things in the read are
+ * assumptions rather than facts taken from the vendor source, and any one of them could be why a
+ * live chip answers nothing: whether the transaction continues on a repeated start or is ended
+ * and begun again, and whether the answer begins with the dummy byte this driver always drops.
+ * Nothing in the vendor tree settles them for this die, so all four are tried side by side, and
+ * the id and the first eight bytes of the register page are printed for each.
+ */
+static bool
+fts_read_registers_as(uint16_t address, uint8_t *data, uint32_t length, unsigned variant)
+{
+	uint8_t buf[FTS_FIFO_DEPTH + 1];
+	uint32_t count = (variant & 1) ? length : length + 1;
+	bool ok = false;
+
+	if (count > sizeof(buf)) {
+		return false;
+	}
+	i2c_start();
+	if (i2c_write_byte((uint8_t)(bus_address << 1)) &&
+	    i2c_write_byte(FTS_CMD_HW_REG) &&
+	    i2c_write_byte((uint8_t)(address >> 8)) &&
+	    i2c_write_byte((uint8_t)(address & 0xff))) {
+		if (variant & 2) {
+			i2c_stop();
+			i2c_delay();
+			i2c_start();
+		} else {
+			i2c_start();
+		}
+		if (i2c_write_byte((uint8_t)(bus_address << 1 | 1))) {
+			for (uint32_t i = 0; i < count; i++) {
+				buf[i] = i2c_read_byte(i + 1 < count);
+			}
+			if (variant & 1) {
+				memcpy(data, buf, length);
+			} else {
+				memcpy(data, buf + 1, length);
+			}
+			ok = true;
+		}
+	}
+	i2c_stop();
+	return ok;
+}
+
+static void
+read_shapes(void)
+{
+	static const char *names[] = {
+		"repeated start, dummy dropped",
+		"repeated start, no dummy",
+		"stop then start, dummy dropped",
+		"stop then start, no dummy",
+	};
+
+	printf("umi_touch: --- the register read, four ways round ---\n");
+	for (unsigned variant = 0; variant < 4; variant++) {
+		uint8_t id[2] = { 0, 0 };
+		uint8_t page[8];
+		bool ok;
+
+		i2c_bus_recover();
+		ok = fts_read_registers_as(FTS_CHIP_ID_ADDR_A, id, sizeof(id), variant);
+		memset(page, 0, sizeof(page));
+		i2c_bus_recover();
+		fts_read_registers_as(0x0000, page, sizeof(page), variant);
+		printf("umi_touch: %u %-32s id %s %02x %02x | 0000 %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		    variant, names[variant], ok ? "read" : "fail", id[0], id[1],
+		    page[0], page[1], page[2], page[3], page[4], page[5], page[6], page[7]);
+	}
+}
+
+/*
  * The same read with an 8-bit register address: {0xB6, reg}, repeated start, dummy, data.
  *
  * That is what this driver did before the vendor source was read, and the sweep that replaced it
@@ -2425,6 +2501,68 @@ int_monitor(void)
 	}
 }
 
+/*
+ * umi_touch_events=1: drain the event FIFO and watch the interrupt line while doing it.
+ *
+ * The chip answers its address and returns zero to every command that exists -- the application's
+ * 0xB6 register read and the boot loader's 0xF9 status read alike -- which leaves exactly one
+ * output that is unambiguously the chip's own: it pulls INT down nine milliseconds after reset and
+ * holds it there. On this part INT low means the FIFO has something in it. So drain the FIFO and
+ * see whether the line comes back up. If it does, reads work and the register file is the only
+ * thing that will not answer; if it does not, this driver has never received a byte from this chip
+ * and every "acknowledge" it has recorded was its own low level read back.
+ */
+static void
+event_probe(void)
+{
+	uint8_t event[FTS_EVENT_SIZE];
+	unsigned line;
+
+	printf("umi_touch: --- the event fifo, and the interrupt line after each read ---\n");
+	line = int_line();
+	printf("umi_touch: int before any read: %u\n", line);
+	for (unsigned i = 0; i < 8; i++) {
+		bool any = false;
+
+		memset(event, 0, sizeof(event));
+		if (!fts_read_event(event)) {
+			printf("umi_touch: event %u: not acknowledged\n", i);
+			break;
+		}
+		for (unsigned b = 0; b < FTS_EVENT_SIZE; b++) {
+			if (event[b]) {
+				any = true;
+			}
+		}
+		line = int_line();
+		printf("umi_touch: event %u: %02x %02x %02x %02x %02x %02x %02x %02x   int %u\n", i,
+		    event[0], event[1], event[2], event[3], event[4], event[5], event[6], event[7],
+		    line);
+		if (!any) {
+			printf("umi_touch: every byte of that event was zero\n");
+			break;
+		}
+	}
+	line = int_line();
+	printf("umi_touch: int after the reads: %u%s\n", line,
+	    line ? "   <- the chip let go, so it did receive them" :
+	    "   <- still low, so nothing was drained");
+
+	if (fts_command(FTS_CMD_SENSE_ON)) {
+		uint8_t id[2] = { 0, 0 };
+		bool ok;
+
+		sleep_ms(20);
+		line = int_line();
+		printf("umi_touch: sense on acknowledged, int now %u\n", line);
+		ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+		printf("umi_touch: id after sense on: %s %02x %02x\n", ok ? "read" : "fail",
+		    id[0], id[1]);
+	} else {
+		printf("umi_touch: the sense on command was not acknowledged\n");
+	}
+}
+
 static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -2442,6 +2580,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t pinswap = 0;
 	uint32_t flasharg = 0;
 	uint32_t burnarg = 0;
+	uint32_t eventsarg = 0;
+	uint32_t shapesarg = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -2473,6 +2613,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	intmon = intmonarg != 0;
 	PE_parse_boot_argn("umi_touch_flash", &flasharg, sizeof(flasharg));
 	PE_parse_boot_argn("umi_touch_burn", &burnarg, sizeof(burnarg));
+	PE_parse_boot_argn("umi_touch_events", &eventsarg, sizeof(eventsarg));
+	PE_parse_boot_argn("umi_touch_shapes", &shapesarg, sizeof(shapesarg));
 	/*
 	 * umi_touch_pinswap=1: the two lines the other way round, for every path in this file.
 	 *
@@ -2523,8 +2665,29 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * from and gpio69 the switch the fts node names, and the part still does not run on those two
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
-	if (sup || proto || bitsweep || scan8 || intmon || flasharg || burnarg) {
+	if (sup || proto || bitsweep || scan8 || intmon || flasharg || burnarg ||
+	    eventsarg || shapesarg) {
 		power_up();
+	}
+	/*
+	 * umi_touch_shapes=1: the four ways to frame a register read, side by side. It comes first
+	 * because it decides what every other read in this file even means.
+	 */
+	if (shapesarg) {
+		i2c_bus_recover();
+		read_shapes();
+		thread_terminate(current_thread());
+		return;
+	}
+	/*
+	 * umi_touch_events=1: drain the FIFO and watch the interrupt line, which is the one output
+	 * of the chip that has been proven to be the chip's own.
+	 */
+	if (eventsarg) {
+		i2c_bus_recover();
+		event_probe();
+		thread_terminate(current_thread());
+		return;
 	}
 	/*
 	 * umi_touch_flash=1: read the flash loader's own status registers and nothing else. This is
