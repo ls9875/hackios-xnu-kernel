@@ -49,6 +49,9 @@
  *   umi_touch_pushpull=1  drive the high half of the clock rather than waiting for a pull-up,
  *                       for a board whose pull-ups are not powered in this boot environment
  *   umi_touch_cmd_db=1  print what RPMh can switch, with the address of each, and stop
+ *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
+ *                       low, 2 does not touch it -- one of the three is the chip out of reset
+ *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -123,6 +126,7 @@ extern kern_return_t thread_terminate(thread_t thread);
 static vm_offset_t tlmm_west, tlmm_south, tlmm_north;
 static vm_offset_t tlmm_one;            /* umi_touch_gpio: put every pin at this base instead */
 static uint32_t stage = 9;              /* umi_touch_stage */
+static uint32_t reset_mode = 1;         /* umi_touch_reset: the level the reset sequence settles at */
 
 /* Which tile a pin's registers live in, out of the table described above. */
 static vm_offset_t
@@ -272,9 +276,10 @@ static bool pushpull;
 static void
 trace(const char *what)
 {
-	printf("umi_touch: ... %s: sda %#x/%u scl %#x/%u reset %#x/%u\n", what,
+	printf("umi_touch: ... %s: sda %#x/%u scl %#x/%u reset %#x/%u int %#x/%u\n", what,
 	    rd(GPIO_CFG(pin_sda)), gpio_get(pin_sda), rd(GPIO_CFG(pin_scl)), gpio_get(pin_scl),
-	    rd(GPIO_CFG(PIN_RESET)), gpio_get(PIN_RESET));
+	    rd(GPIO_CFG(PIN_RESET)), gpio_get(PIN_RESET),
+	    rd(GPIO_CFG(PIN_INT)), gpio_get(PIN_INT));
 }
 
 /* A line is open drain: released is an input with the pull-up on, pulled down is an output. */
@@ -636,18 +641,34 @@ probe(unsigned sda, unsigned scl, bool verbose)
 		trace("the bus looked at");
 	}
 
-	gpio_set(PIN_RESET, false);
-	sleep_ms(2);
-	if (verbose) {
-		trace("2 ms in reset");
-	}
-	gpio_set(PIN_RESET, true);
-	if (verbose) {
-		trace("out of reset");
+	/*
+	 * Which level means "in reset" is not written down. The overlay gives the line as
+	 * <&tlmm 38 0>, which reads as active high, and an active-high reset is asserted by driving
+	 * the line high -- yet the vendor's own fts_reset_proc ends with the line high, which is
+	 * what an active-low reset looks like when the chip is let go. One of those leaves the chip
+	 * held in reset, and a chip in reset does not acknowledge anything, which is exactly what
+	 * the bus reports. So umi_touch_reset chooses the level the sequence settles at: 1 high (as
+	 * this driver has always done), 0 low, 2 leaves the line alone. Either way the pulse goes
+	 * the other way first, so there is a real edge.
+	 */
+	if (reset_mode != 2) {
+		bool settle_high = reset_mode != 0;
+
+		gpio_set(PIN_RESET, !settle_high);
+		sleep_ms(2);
+		if (verbose) {
+			trace("2 ms pulsed the other way");
+		}
+		gpio_set(PIN_RESET, settle_high);
+		if (verbose) {
+			trace(settle_high ? "reset settled high" : "reset settled low");
+		}
+	} else if (verbose) {
+		trace("reset left where it was");
 	}
 	sleep_ms(200);                    /* the vendor's fts_reset_proc, then time to boot the app */
 	if (verbose) {
-		trace("200 ms after reset");
+		trace("200 ms later");
 	}
 
 	for (int attempt = 0; attempt < 5; attempt++) {
@@ -805,6 +826,11 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_gpio", &one, sizeof(one));
 	PE_parse_boot_argn("umi_touch_pushpull", &pp, sizeof(pp));
 	pushpull = pp != 0;
+	PE_parse_boot_argn("umi_touch_reset", &reset_mode, sizeof(reset_mode));
+	PE_parse_boot_argn("umi_touch_bit_us", &bit_us, sizeof(bit_us));
+	if (bit_us < 1 || bit_us > 1000) {
+		bit_us = 3;
+	}
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
