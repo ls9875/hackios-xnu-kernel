@@ -118,6 +118,7 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define GPIO_CFG(n)              (gpio_tile(n) + 0x1000UL * (n))         /* [1:0] pull, [5:2] function, [8:6] drive, [9] output */
 #define GPIO_IO(n)               (gpio_tile(n) + 0x1000UL * (n) + 4)     /* bit 0 in, bit 1 out */
 #define PULL_NONE                0
+#define PULL_DOWN                1
 #define PULL_UP                  3
 
 #define PIN_SDA                  36      /* qupv3_se13_i2c_active: "qup13" */
@@ -1712,14 +1713,48 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		uint8_t id[2] = { 0, 0 };
 
 		pins_for_i2c();
-		printf("umi_touch: a real power cycle: reset low, smpa4 off, smpa4 on, reset high\n");
-		gpio_output(PIN_RESET, false, PULL_NONE, 2);
-		printf("umi_touch: smpa4 off: %s\n", panel_supply_off("smpa4") ? "done" : "refused");
+		/*
+		 * The order matters and it is the point of this whole step. The I2C lines are driven low
+		 * *first*, while the rail is still up, and they stay low while it goes down. Driving them
+		 * high into an unpowered part is what this driver has been doing for every run of this
+		 * session -- the lines go into the chip's esd diodes and back-power it through them, into
+		 * a state no reset can reach, because reset only resets the digital core and the state
+		 * machine that answers i2c is not in it. A part that acknowledges its address and returns
+		 * zeros to everything is what that looks like from the outside.
+		 *
+		 * pc=1 drops the panel's own io rail (gpio69, touch_vddio_vreg in the overlay), pc=2
+		 * drops pm8150_s4, pc=3 does both. The overlay names only the first; the second is here
+		 * because "only the first" is how the last several wrong answers happened.
+		 */
+		printf("umi_touch: a real power cycle: lines low, rail off, rail on, reset\n");
+		line_low(pin_sda);
+		line_low(pin_scl);
+		if (pc & 1) {
+			printf("umi_touch: gpio%u off (was %#x/%u)\n", PIN_AVDD,
+			    rd(GPIO_CFG(PIN_AVDD)), gpio_get(PIN_AVDD));
+			gpio_output(PIN_AVDD, false, PULL_DOWN, 2);
+		}
+		if (pc & 2) {
+			printf("umi_touch: smpa4 off: %s\n", panel_supply_off("smpa4") ? "done" : "refused");
+		}
 		sleep_ms(200);
 		printf("umi_touch: with the rail off: sda %u scl %u reset %u int %u\n",
 		    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_RESET), gpio_get(PIN_INT));
-		printf("umi_touch: smpa4 on: %s\n", panel_supply_on("smpa4") ? "done" : "refused");
-		sleep_ms(40);
+		if (pc & 1) {
+			gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+			printf("umi_touch: gpio%u on: %#x/%u\n", PIN_AVDD,
+			    rd(GPIO_CFG(PIN_AVDD)), gpio_get(PIN_AVDD));
+		}
+		if (pc & 2) {
+			printf("umi_touch: smpa4 on: %s\n", panel_supply_on("smpa4") ? "done" : "refused");
+		}
+		sleep_ms(50);
+		/* now let the pair go, and give the part the reset the vendor's power cycle gives it */
+		line_release(pin_sda);
+		line_release(pin_scl);
+		sleep_ms(10);
+		gpio_output(PIN_RESET, false, PULL_NONE, 2);
+		sleep_ms(20);
 		gpio_output(PIN_RESET, true, PULL_NONE, 2);
 		sleep_ms(settle_ms);
 		printf("umi_touch: after the power cycle: sda %u scl %u reset %u int %u\n",
