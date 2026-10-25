@@ -330,9 +330,12 @@ i2c_delay(void)
 static void
 scl_high(void)
 {
-	scl_high();
-	for (int i = 0; i < 4000 && !gpio_get(pin_scl); i++) {
-		sleep_us(1);            /* the slave is holding it down; give it the time it is asking for */
+	uint64_t deadline;
+
+	line_release(pin_scl);
+	clock_interval_to_deadline(4000, NSEC_PER_USEC, &deadline);     /* 4 ms of wall time, at most */
+	while (!gpio_get(pin_scl) && mach_absolute_time() < deadline) {
+		/* the slave is holding SCL down; that is it asking for time, so give it */
 	}
 }
 
