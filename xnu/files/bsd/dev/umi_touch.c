@@ -565,6 +565,9 @@ read_chip_id(uint8_t *high, uint8_t *low)
 static void
 line_test(void)
 {
+	unsigned pull;
+
+	/* First: can the pad drive the line both ways at all? */
 	for (int i = 0; i < 2; i++) {
 		unsigned pin = i ? PIN_SCL : PIN_SDA;
 
@@ -572,19 +575,24 @@ line_test(void)
 		printf("umi_touch: ... gpio%u driven low -> %u\n", pin, gpio_get(pin));
 		gpio_output(pin, true, PULL_NONE, 2);
 		printf("umi_touch: ... gpio%u driven high -> %u\n", pin, gpio_get(pin));
-		gpio_configure(pin, 0, PULL_UP, 2, false);
-		/*
-		 * Read it again later, because the first read after the driver lets go cannot tell a
-		 * pull-up from the capacitance of the line and a read that is simply too soon: what
-		 * comes back at once says nothing, and what is still there 200 us and 2 ms later says
-		 * whether anything is really holding the line up.
-		 */
-		printf("umi_touch: ... gpio%u released, pull-up on -> %u\n", pin, gpio_get(pin));
-		sleep_us(200);
-		printf("umi_touch: ... gpio%u released, 200 us later -> %u\n", pin, gpio_get(pin));
-		sleep_ms(2);
-		printf("umi_touch: ... gpio%u released, 2 ms later -> %u\n", pin, gpio_get(pin));
 	}
+	/*
+	 * Then: which of the four values of the pull field holds a released line up? The usual
+	 * description is 0 none, 1 pull-down, 2 keeper, 3 pull-up, and the field does read back what
+	 * is written -- but a line that decays to 0 within 200 us of the driver being switched off
+	 * is a line with nothing holding it up, whatever the register says. Trying all four on the
+	 * device answers it without relying on that description being right for this SoC.
+	 */
+	for (pull = 0; pull <= 3; pull++) {
+		gpio_configure(PIN_SDA, 0, pull, 2, false);
+		gpio_configure(PIN_SCL, 0, pull, 2, false);
+		sleep_us(200);
+		printf("umi_touch: ... pull=%u cfg %#x/%#x, released: sda %u scl %u\n", pull,
+		    rd(GPIO_CFG(PIN_SDA)), rd(GPIO_CFG(PIN_SCL)), gpio_get(PIN_SDA), gpio_get(PIN_SCL));
+	}
+	/* leave the pair as the driver will use them */
+	gpio_configure(PIN_SDA, 0, PULL_UP, 2, false);
+	gpio_configure(PIN_SCL, 0, PULL_UP, 2, false);
 }
 
 /* One try at one pin order: reset the chip, let its firmware come up, ask who it is. */
