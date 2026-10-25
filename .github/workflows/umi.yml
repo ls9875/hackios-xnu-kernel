@@ -3,10 +3,15 @@ name: umi
 # Build what the Mi 10 (umi, SM8250) port needs, on a Linux host, without a Linux host.
 #
 #   loader  always   -- proves xnuloader's platform_umi compiles; artifact loader.efi
+#   kernel  always   -- XNU with the port on top, for `xl run` to upload; artifact umi-kernel
 #   uefi    optional -- Mu-Silicium with Platforms/Xiaomi/umiPkg; artifact SILICIUM_UEFI.fd
 #   images  optional -- iOS 16.5 out of Apple's IPSW and the APFS images; artifact images
 #
-# The iOS IPSW is 7.4 GB and the images are ~2.5 GB, so `images` is the slow one.
+# The iOS IPSW is 7.4 GB and the images are ~2.5 GB, so `images` is the slow one. The kernel
+# job is the other slow one: theos and its Linux toolchain are about 2 GB, and XNU itself
+# takes a while. Neither is needed for `fastboot boot` -- the kernel is uploaded over USB by
+# `xl run` (xnuloader/mkpayload.py), not carried in the boot image -- so this job exists for
+# kernel-side work: drivers, boot-args, anything under xnu/.
 
 on:
   workflow_dispatch:
@@ -20,10 +25,10 @@ on:
         type: boolean
         default: false
 
+# Concurrency, per kind of run. Grouping on the ref alone serialised everything: an images run
+# (up to 5 h) would sit in front of a UEFI run, and the two share nothing but a checkout.
+# Two runs of the same kind still queue behind each other, which is what the group is for.
 concurrency:
-  # One group per ref *and* per kind of run. Grouping on the ref alone serialised everything: an
-  # images run (up to 5 h) would sit in front of a UEFI run, and the two share nothing but a checkout.
-  # Two UEFI runs still queue behind each other, which is what the group is for.
   group: umi-${{ github.ref }}-uefi-${{ github.event.inputs.uefi }}-images-${{ github.event.inputs.images }}
   cancel-in-progress: false
 
@@ -63,6 +68,112 @@ jobs:
         with:
           name: umi-loader
           path: xnuloader/loader.efi
+          if-no-files-found: error
+
+  kernel:
+    name: kernel (XNU for umi)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Its own group: a kernel run and a UEFI run share nothing but a checkout, and a kernel run
+    # must not queue behind an images run that takes hours.
+    concurrency:
+      group: umi-${{ github.ref }}-kernel
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm flex bison m4 perl python3 autoconf automake \
+            libtool curl xz-utils git build-essential libxml2 libtinfo6
+          clang --version | head -1
+
+      # theos: the cctools Mach-O linker the kernel is linked with. Its Linux toolchain is a
+      # prebuilt clang for arm64-apple-ios, unpacked over toolchain/linux/iphone.
+      - name: theos and its Linux toolchain
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          git clone --depth 1 https://github.com/theos/theos.git "$THEOS"
+          curl -fsSL --retry 3 \
+            https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
+            | tar -xJf - -C "$THEOS/toolchain/"
+          test -x "$THEOS/toolchain/linux/iphone/bin/clang"
+          test -x "$THEOS/toolchain/linux/iphone/bin/ld"
+
+      # xnu/README.md was written against clang 22; the distribution's is older. Take the
+      # newest the LLVM project packages, so the kernel sees the compiler it was tested with.
+      - name: A clang of this decade (apt.llvm.org)
+        run: |
+          . /etc/os-release
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc >/dev/null
+          echo "deb http://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME main" \
+            | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-21 lld-21
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 200
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 200
+          clang --version | head -1
+
+      # iPhoneOS16.5.sdk is what the kernel is compiled against; it is in the current release
+      # of github.com/theos/sdks. Read the tag through the API rather than hard-coding it.
+      - name: iPhoneOS16.5.sdk
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          mkdir -p "$THEOS/sdks"
+          tag=$(curl -fsSL https://api.github.com/repos/theos/sdks/releases/latest \
+            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+          [ -n "$tag" ] || { echo "::error::cannot read the theos/sdks release tag"; exit 1; }
+          echo "iPhoneOS16.5.sdk from theos/sdks@$tag"
+          curl -fsSL --retry 3 \
+            "https://github.com/theos/sdks/releases/download/$tag/iPhoneOS16.5.sdk.tar.xz" \
+            | tar -xJf - -C "$THEOS/sdks"
+          test -d "$THEOS/sdks/iPhoneOS16.5.sdk/usr/include"
+
+      - name: XNU sources with the port on top (xnu/apply.sh)
+        run: bash xnu/apply.sh
+
+      # stage 1: Apple's open sources the kernel links, mig/unifdef/tcsh, and the SDK as links
+      - name: Dependencies (xnu-deps/setup.sh --stage1)
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: bash xnu-deps/setup.sh --stage1
+
+      # stage 2 needs the kernel's exported headers, so the export comes first and the script
+      # again -- common/build.sh does the same two steps in this order.
+      - name: Export the kernel's headers
+        run: ./xnu-build.sh -j"$(nproc)" exporthdrs
+
+      - name: Dependencies (xnu-deps/setup.sh --stage2)
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: bash xnu-deps/setup.sh --stage2
+
+      - name: Build
+        run: |
+          # pipefail: a failed build must not look green because tee was the last command
+          set -o pipefail
+          ./xnu-build.sh -j"$(nproc)" -k 2>&1 | tee kernel-build.log
+          K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          [ -s "$K" ] || { echo "::error::no kernel was built"; tail -80 kernel-build.log; exit 1; }
+          echo "kernel $(stat -c %s $K) bytes"
+          # the port's drivers have to be in it: a build that silently dropped one would still
+          # boot, just without the touch screen
+          nm "$K" 2>/dev/null | grep -q -w umi_touch_init \
+            || { echo "::error::umi_touch_init is not in the kernel"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: umi-kernel
+          path: xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
           if-no-files-found: error
 
   uefi:
