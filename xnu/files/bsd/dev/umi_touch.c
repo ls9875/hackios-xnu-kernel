@@ -1277,6 +1277,24 @@ protocol_scan(void)
 			break;
 		}
 	}
+
+	/*
+	 * The last state that would look like this from outside is sleep. Android was running before
+	 * this kernel, its driver had the part suspended, and a part in its low-power state can keep
+	 * the i2c block answering while the register file reads zero -- which is why sense-on is sent
+	 * before this read and not after it. Three reads in a row, because a register that is really
+	 * there answers the same thing every time and a shift or a timing problem does not.
+	 */
+	printf("umi_touch: --- the id again, three times, after sense on ---\n");
+	for (unsigned i = 0; i < 3; i++) {
+		memset(data, 0, sizeof(data));
+		if (!fts_read_registers(FTS_CHIP_ID_ADDR_A, data, 2)) {
+			printf("umi_touch: id %u: not acknowledged\n", i);
+			continue;
+		}
+		printf("umi_touch: id %u: %02x %02x   sda %u scl %u int %u\n", i, data[0], data[1],
+		    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_INT));
+	}
 	printf("umi_touch: at the end: sda %u scl %u int %u\n",
 	    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_INT));
 }
