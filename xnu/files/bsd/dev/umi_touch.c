@@ -372,6 +372,23 @@ static bool pushpull;
 static uint8_t bus_address = I2C_ADDRESS;
 
 /*
+ * umi_touch_intmon=1: sample the interrupt line across a reset, and keep the eight samples of
+ * every byte a read returns.
+ *
+ * The chip acknowledges its address and answers zero for everything, and there is one state on
+ * this side that looks exactly the same: a slave left half-way through a byte holds SDA down, so
+ * every byte "acknowledges" and every bit samples as zero. The comment on i2c_bus_recover() says
+ * so in as many words. What separates "answering zeros" from "not answering at all" is not the
+ * data line -- it is the interrupt line. A part that is powered and out of reset drives INT as it
+ * boots and again when it sleeps; a part with no supply, or one held in reset, cannot drive it.
+ * So: release the reset with INT pulled up and watch for a level that only the chip can produce.
+ */
+static bool intmon;
+static bool record_bits;            /* the eight SDA samples of each byte go into bits_seen */
+static uint32_t bits_seen;
+static int bits_count;
+
+/*
  * Where the bring-up is, one line per step. A run that stops leaves its last line behind, so
  * "no chip ID" stops being one uninformative silence and becomes a place -- which is the only
  * way to find anything from a log when the alternative is a phone that says nothing at all.
@@ -488,7 +505,13 @@ i2c_read_byte(bool ack)
 		i2c_delay();
 		scl_high();
 		i2c_delay();
-		value = (uint8_t)(value << 1 | (gpio_get(pin_sda) ? 1 : 0));
+		bool sample = gpio_get(pin_sda);
+
+		value = (uint8_t)(value << 1 | (sample ? 1 : 0));
+		if (record_bits && bits_count < 32) {
+			bits_seen = bits_seen << 1 | (sample ? 1 : 0);
+			bits_count++;
+		}
 		line_low(pin_scl);
 		i2c_delay();
 	}
@@ -2015,6 +2038,79 @@ power_up(void)
 	power_id("out of reset");
 }
 
+/* The interrupt line read as an input with its pull-up on: only the chip can pull it low. */
+static bool
+int_line(void)
+{
+	gpio_configure(PIN_INT, 0, PULL_UP, 2, false);
+	sleep_us(200);
+	return gpio_get(PIN_INT);
+}
+
+/*
+ * umi_touch_intmon=1: the interrupt line, sampled before the reset, while it is held, and for a
+ * quarter of a second after it is released; then one register read with every SDA sample kept,
+ * and the data line checked again once the master has let go of it.
+ *
+ * Three things this separates that no count of zeros could:
+ *  - a chip that drives INT at any point is powered and out of reset, whatever its registers say;
+ *  - a byte whose eight samples are all zero is a slave holding the line down, and a byte with a
+ *    mix of ones and zeros is a slave sending a value this driver is not framing correctly;
+ *  - SDA still low a millisecond after the transfer ends means the slave owns the line, and every
+ *    "acknowledge" this driver has ever recorded was its own low level read back.
+ */
+static void
+int_monitor(void)
+{
+	static const unsigned rates[] = { 3, 10, 50 };
+	uint8_t id[2];
+	bool before, held, after, last;
+	unsigned edges = 0;
+
+	printf("umi_touch: --- the interrupt line, through a reset ---\n");
+	before = int_line();
+	printf("umi_touch: int as found                    %u\n", before);
+
+	gpio_output(PIN_RESET, false, PULL_NONE, 2);
+	sleep_ms(5);
+	held = int_line();
+	printf("umi_touch: int with reset held low         %u\n", held);
+
+	last = held;
+	gpio_output(PIN_RESET, true, PULL_NONE, 2);
+	for (unsigned i = 0; i < 250; i++) {
+		bool now = int_line();
+
+		if (now != last) {
+			edges++;
+			printf("umi_touch: int changed to %u at %u ms after reset\n", now, i);
+			last = now;
+		}
+		sleep_ms(1);
+	}
+	after = int_line();
+	printf("umi_touch: int after release               %u, %u edge(s)\n", after, edges);
+
+	for (unsigned i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+		bool ok;
+
+		bit_us = rates[i];
+		i2c_bus_recover();
+		bits_seen = 0;
+		bits_count = 0;
+		record_bits = true;
+		ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+		record_bits = false;
+		printf("umi_touch: bit_us %2u: id %02x %02x (%s), samples %#010x over %d bits\n",
+		    rates[i], id[0], id[1], ok ? "read" : "fail", bits_seen, bits_count);
+		line_release(pin_sda);
+		sleep_ms(1);
+		printf("umi_touch:            sda a millisecond after the read: %u%s\n",
+		    gpio_get(pin_sda),
+		    gpio_get(pin_sda) ? "" : "   <- the chip is holding it down");
+	}
+}
+
 static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -2028,6 +2124,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t proto = 0;
 	uint32_t bitsweep = 0;
 	uint32_t scan8 = 0;
+	uint32_t intmonarg = 0;
+	uint32_t pinswap = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -2055,6 +2153,25 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_proto", &proto, sizeof(proto));
 	PE_parse_boot_argn("umi_touch_bitsweep", &bitsweep, sizeof(bitsweep));
 	PE_parse_boot_argn("umi_touch_scan8", &scan8, sizeof(scan8));
+	PE_parse_boot_argn("umi_touch_intmon", &intmonarg, sizeof(intmonarg));
+	intmon = intmonarg != 0;
+	/*
+	 * umi_touch_pinswap=1: the two lines the other way round, for every path in this file.
+	 *
+	 * The fragment lists qupv3_se13_i2c_active as "gpio36", "gpio37" and says nothing about which
+	 * of the two is data. This driver assumed 36 is data, and what it then measured fits the
+	 * other assignment just as well: exactly one address acknowledges, every register reads zero,
+	 * and the data line sits low for as long as the chip is out of reset. A chip whose *clock*
+	 * is on the line this driver samples as data holds that line down exactly like that, and the
+	 * holds in the last short of the address are read as acknowledges. One run settles it.
+	 */
+	PE_parse_boot_argn("umi_touch_pinswap", &pinswap, sizeof(pinswap));
+	if (pinswap) {
+		unsigned t = pin_sda;
+
+		pin_sda = pin_scl;
+		pin_scl = t;
+	}
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
@@ -2076,6 +2193,9 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	if (pushpull) {
 		printf("umi_touch: driving the high half of the clock instead of waiting for a pull-up\n");
 	}
+	if (pinswap) {
+		printf("umi_touch: sda gpio%u and scl gpio%u, the other way round\n", pin_sda, pin_scl);
+	}
 
 	show_pins("as found");
 	/*
@@ -2085,8 +2205,19 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * from and gpio69 the switch the fts node names, and the part still does not run on those two
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
-	if (sup || proto || bitsweep || scan8) {
+	if (sup || proto || bitsweep || scan8 || intmon) {
 		power_up();
+	}
+	/*
+	 * umi_touch_intmon=1: see int_monitor(). Three reads at three rates, with every sample of
+	 * every byte kept, the interrupt line watched across a reset, and the data line read again
+	 * once the master has let go of it.
+	 */
+	if (intmon) {
+		i2c_bus_recover();
+		int_monitor();
+		thread_terminate(current_thread());
+		return;
 	}
 	/*
 	 * umi_touch_scan8=1: which addresses, anywhere in the space, answer with something other
