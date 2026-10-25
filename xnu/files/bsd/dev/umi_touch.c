@@ -349,17 +349,21 @@ i2c_bus_recover(void)
 	}
 	printf("umi_touch: the bus is stuck with SDA low; clocking it free\n");
 	for (pulses = 0; pulses < 9 && !gpio_get(pin_sda); pulses++) {
+		printf("umi_touch: ... pulse %d: sda %u scl %#x\n", pulses,
+		    gpio_get(pin_sda), rd(GPIO_CFG(pin_scl)));
 		line_low(pin_scl);
 		i2c_delay();
 		line_release(pin_scl);
 		i2c_delay();
 	}
+	printf("umi_touch: ... %d pulse(s), sda now %u\n", pulses, gpio_get(pin_sda));
 	line_low(pin_sda);
 	i2c_delay();
 	line_release(pin_scl);
 	i2c_delay();
 	line_release(pin_sda);
 	i2c_delay();
+	printf("umi_touch: ... recover done, sda %u scl %u\n", gpio_get(pin_sda), gpio_get(pin_scl));
 }
 
 /* Write the register, repeat the start, read the bytes: the whole of I2C register access. */
