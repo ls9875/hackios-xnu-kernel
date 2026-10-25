@@ -54,7 +54,11 @@
  *                       for a board whose pull-ups are not powered in this boot environment
  *   umi_touch_cmd_db=1  print what RPMh can switch, with the address of each, and stop
  *   umi_touch_scan=1    ask every address on the bus who is there, before anything else, and stop
- *   umi_touch_supply=1  ask RPMh for pm8150a_l1 (ldoc1, 1.8 V) before touching the bus
+ *   umi_touch_supply=1  ask RPMh for pm8150a_l1 (ldoc1, 1.8 V) and for pm8150_s4 (smpa4, the
+ *                       part's avdd) before touching the bus
+ *   umi_touch_pcycle=1  switch smpa4 off and back on with the reset held low, then send the
+ *                       rom's warm boot: the only thing that clears state a previous run left
+ *                       behind, because `fastboot boot` never power-cycles the SoC. Stops after.
  *   umi_touch_diff=1    read the whole map three times and print only what changes between
  *   umi_touch_wtest=1   read the ID and the firmware version five times, then stop: a stable
  *                       pair proves the dummy byte is being dropped in the right place
@@ -1104,6 +1108,7 @@ sample_bits(uint16_t address)
 }
 
 static bool panel_supply_on(const char *name);   /* pm8150_s4 / smpa4, defined with the RPMh code below */
+static bool panel_supply_off(const char *name);
 
 /*
  * Everything the read path could still have wrong, in one boot.
@@ -1185,6 +1190,37 @@ sweep(void)
 		if (!answered) {
 			printf("umi_touch: avdd did not change the answer; the readings above are from a part "
 			    "that either has no firmware or is not the thing at %#x\n", I2C_ADDRESS);
+		}
+	}
+
+	/*
+	 * A read of 0x00 is ambiguous in one more way: it can mean "the register file says zero" or
+	 * "the register file is not there". A write that comes back is the difference. IER is the one
+	 * register the vendor driver both writes and relies on, and it exists at 0x001c on one chip
+	 * variant and 0x002c on the other, so both are tried with the same value.
+	 */
+	printf("umi_touch: --- does a write stick? ---\n");
+	{
+		static const uint16_t regs[] = { 0x001c, 0x002c };
+		uint8_t back[2];
+
+		for (unsigned r = 0; r < 2; r++) {
+			uint8_t want = FTS_IER_ENABLE;
+
+			if (!fts_write_registers(regs[r], &want, 1)) {
+				printf("umi_touch: write %#06x <- %02x: not acked\n", regs[r], want);
+				continue;
+			}
+			back[0] = back[1] = 0;
+			if (!fts_read_registers(regs[r], back, 2)) {
+				printf("umi_touch: write %#06x <- %02x: acked, read back not acked\n",
+				    regs[r], want);
+				continue;
+			}
+			printf("umi_touch: write %#06x <- %02x: read back %02x %02x -> %s\n", regs[r], want,
+			    back[0], back[1],
+			    back[0] == want ? "the register file is alive"
+			    : "the write did not stick");
 		}
 	}
 
@@ -1525,6 +1561,38 @@ panel_supply_on(const char *name)
 	return rpmh_write(address, data, 2);
 }
 
+/*
+ * The same rail, off. Nothing has ever switched it off in this port, and that is the point: this
+ * phone is booted with `fastboot boot`, which does not power-cycle the SoC, so whatever state the
+ * touch controller was left in by the last run is the state the next run finds it in. A chip that
+ * was half way through a byte, or that had its interface register written to something it did not
+ * like, stays that way across every run -- and a reset pulse does not clear it, because reset only
+ * resets the digital core, not the state machine that is waiting for the rest of a byte.
+ *
+ * Only the rail being dropped clears that. It is a separate boot argument and not part of the
+ * normal sweep because it is the one step here that can take the phone down: if smpa4 feeds
+ * anything besides the touch panel, switching it off costs the run.
+ */
+static bool
+panel_supply_off(const char *name)
+{
+	uint32_t base = rpmh_address(name);
+	uint32_t address[1];
+	uint32_t data[1];
+
+	if (!rsc) {
+		rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	}
+	if (base == 0) {
+		printf("umi_touch: RPMh has no regulator \"%s\"\n", name);
+		return false;
+	}
+	address[0] = base + VRM_ENABLE;
+	data[0] = 0;                    /* off */
+	printf("umi_touch: RPMh: %s off\n", name);
+	return rpmh_write(address, data, 1);
+}
+
 static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -1534,6 +1602,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t df = 0;
 	uint32_t wt = 0;
 	uint32_t sw = 0;
+	uint32_t pc = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -1557,6 +1626,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_wtest", &wt, sizeof(wt));
 	PE_parse_boot_argn("umi_touch_settle_ms", &settle_ms, sizeof(settle_ms));
 	PE_parse_boot_argn("umi_touch_sweep", &sw, sizeof(sw));
+	PE_parse_boot_argn("umi_touch_pcycle", &pc, sizeof(pc));
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
@@ -1637,6 +1707,46 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	idle_looks = 80000 / poll_us;    /* a read every 80 ms even with the line high, in case it is missed */
 
+	if (pc) {
+		uint8_t wb = 0x38;              /* ADDR_WARM_BOOT 0x001e, WARM_BOOT_VALUE, ftsHardware.h */
+		uint8_t id[2] = { 0, 0 };
+
+		pins_for_i2c();
+		printf("umi_touch: a real power cycle: reset low, smpa4 off, smpa4 on, reset high\n");
+		gpio_output(PIN_RESET, false, PULL_NONE, 2);
+		printf("umi_touch: smpa4 off: %s\n", panel_supply_off("smpa4") ? "done" : "refused");
+		sleep_ms(200);
+		printf("umi_touch: with the rail off: sda %u scl %u reset %u int %u\n",
+		    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_RESET), gpio_get(PIN_INT));
+		printf("umi_touch: smpa4 on: %s\n", panel_supply_on("smpa4") ? "done" : "refused");
+		sleep_ms(40);
+		gpio_output(PIN_RESET, true, PULL_NONE, 2);
+		sleep_ms(settle_ms);
+		printf("umi_touch: after the power cycle: sda %u scl %u reset %u int %u\n",
+		    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_RESET), gpio_get(PIN_INT));
+		(void)fts_read_verbose(FTS_CHIP_ID_ADDR_A, 2, 1, "id after a power cycle");
+		(void)fts_read_verbose(FTS_CHIP_ID_ADDR_B, 2, 1, "id after a power cycle");
+		/*
+		 * The last thing the vendor's flasher does after burning a firmware is tell the chip to
+		 * run it: 0x38 to 0x001e. If this part is sitting in its rom because the application
+		 * never started, this is the command that starts it -- and if it is not, 0x001e is a
+		 * filter register in the running application and 0x38 only sets a flag in it.
+		 */
+		printf("umi_touch: warm boot, %#06x <- %02x: %s\n", 0x001e, wb,
+		    fts_write_registers(0x001e, &wb, 1) ? "acked" : "not acked");
+		sleep_ms(300);
+		(void)fts_read_verbose(FTS_CHIP_ID_ADDR_A, 2, 1, "id after a warm boot");
+		(void)fts_read_verbose(FTS_CHIP_ID_ADDR_B, 2, 1, "id after a warm boot");
+		if (fts_read_registers(FTS_CHIP_ID_ADDR_A, id, 2)) {
+			printf("umi_touch: after a power cycle and a warm boot: id %02x %02x\n",
+			    id[0], id[1]);
+		}
+		sample_bits(FTS_CHIP_ID_ADDR_A);
+		printf("umi_touch: at the end: sda %u scl %u int %u\n",
+		    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_INT));
+		thread_terminate(current_thread());
+		return;
+	}
 	if (sw) {
 		pins_for_i2c();
 		gpio_set(PIN_RESET, reset_mode != 0);
