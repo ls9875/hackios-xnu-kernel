@@ -85,6 +85,13 @@
  *                       separates "the chip answers zeros" from "this driver cannot hear it":
  *                       the engine reports completion, failure, and a refusal on an address
  *                       nobody owns, none of which a hand-driven clock can tell you.
+ *   umi_touch_recover=1 every bring-up variation a boot rom could be waiting for, in one run:
+ *                       five settle times after the reset, the vendor's power-cycle order with
+ *                       the reset held while the rails rise, a half-second reset, the reset
+ *                       released with the clock low and with both lines low, and the loader's
+ *                       unlock asked once more afterwards. Each one ends with the chip id and the
+ *                       head of the register page, so one log either finds the combination or
+ *                       rules all of them out. Powers up first and stops after.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -2465,10 +2472,126 @@ power_up(void)
 	power_id("out of reset");
 }
 
+/*
+ * umi_touch_recover=1: the bring-up variations, all of them in one run.
+ *
+ * The part acknowledges its address, asserts its interrupt line a fifth of a second after the
+ * reset goes high, and answers 0x00 to every register read and every write. The protocol matches
+ * ftsIO.c byte for byte, the wiring is settled (0x48 silent, 0x49 answering), and every rail the
+ * board has is up, so what is left is the order and the timing of the reset itself -- the one part
+ * of a bring-up a boot rom can care about and no reading from here can confirm.
+ *
+ * Every variation ends by asking the same question, the chip id, and prints the head of the
+ * register page with it: 36 70 or 39 6c is the core running, and a page that is not all zero is a
+ * core that answers something even if it is not that.
+ */
+static void
+recover_page(const char *when)
+{
+	uint8_t id[2] = { 0, 0 };
+	uint8_t page[8];
+
+	for (unsigned i = 0; i < sizeof(page); i++) {
+		page[i] = 0;
+	}
+	if (!fts_read_registers(FTS_CHIP_ID_ADDR_A, id, 2)) {
+		printf("umi_touch: recover: %-36s not acknowledged\n", when);
+		return;
+	}
+	(void)fts_read_registers(0x0000, page, sizeof(page));
+	printf("umi_touch: recover: %-36s id %02x %02x  0000: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	    when, id[0], id[1], page[0], page[1], page[2], page[3], page[4], page[5], page[6],
+	    page[7]);
+}
+
+static void
+recover_sweep(void)
+{
+	static const uint32_t settles[] = { 20, 200, 500, 1000, 3000 };
+
+	printf("umi_touch: --- recover: the ways a boot rom could be waiting ---\n");
+
+	/* 1. how long the application takes, if an application is coming up at all */
+	for (unsigned i = 0; i < sizeof(settles) / sizeof(settles[0]); i++) {
+		gpio_output(PIN_RESET, false, PULL_NONE, 2);
+		sleep_ms(20);
+		gpio_output(PIN_RESET, true, PULL_NONE, 2);
+		sleep_ms(settles[i]);
+		printf("umi_touch: recover: after a reset and %u ms\n", (unsigned)settles[i]);
+		recover_page("its id");
+	}
+
+	/*
+	 * 2. fts_chip_powercycle2 in its own order rather than this driver's: reset asserted while
+	 * the rails come up, and not released until they have settled. A part that starts booting on
+	 * a rail still rising can latch into a state a later reset pulse does not clear.
+	 */
+	printf("umi_touch: recover: power cycle, reset held while the rails come up\n");
+	gpio_output(PIN_RESET, false, PULL_NONE, 2);
+	gpio_output(PIN_AVDD, false, PULL_DOWN, 2);
+	gpio_output(PIN_VBOOST, false, PULL_DOWN, 2);
+	gpio_output(PIN_VCI, false, PULL_DOWN, 2);
+	sleep_ms(100);
+	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	sleep_ms(5);
+	gpio_output(PIN_VBOOST, true, PULL_NONE, 2);
+	sleep_ms(5);
+	gpio_output(PIN_VCI, true, PULL_NONE, 2);
+	sleep_ms(40);
+	gpio_output(PIN_RESET, true, PULL_NONE, 2);
+	sleep_ms(300);
+	recover_page("after the power cycle");
+
+	/* 3. a reset held far longer than the datasheet asks for */
+	printf("umi_touch: recover: a half second in reset\n");
+	gpio_output(PIN_RESET, false, PULL_NONE, 2);
+	sleep_ms(500);
+	gpio_output(PIN_RESET, true, PULL_NONE, 2);
+	sleep_ms(300);
+	recover_page("after a half-second reset");
+
+	/*
+	 * 4. the clock line held low while the reset is released. Parts like this sample their strap
+	 * pins at that moment, and a busy bus is one of the straps.
+	 */
+	printf("umi_touch: recover: reset released with the clock held low\n");
+	line_low(pin_scl);
+	gpio_output(PIN_RESET, false, PULL_NONE, 2);
+	sleep_ms(20);
+	gpio_output(PIN_RESET, true, PULL_NONE, 2);
+	sleep_ms(300);
+	line_release(pin_scl);
+	sleep_ms(2);
+	recover_page("after a reset with scl low");
+
+	/* 5. ... and with both lines low, the other half of the same idea */
+	printf("umi_touch: recover: reset released with both lines held low\n");
+	line_low(pin_scl);
+	line_low(pin_sda);
+	gpio_output(PIN_RESET, false, PULL_NONE, 2);
+	sleep_ms(20);
+	gpio_output(PIN_RESET, true, PULL_NONE, 2);
+	sleep_ms(300);
+	line_release(pin_sda);
+	line_release(pin_scl);
+	sleep_ms(2);
+	recover_page("after a reset with both lines low");
+
+	/* 6. the one command a boot rom always listens for, asked once more on this state */
+	printf("umi_touch: recover: the loader's unlock, after all of that\n");
+	{
+		uint8_t unlock[3] = { FLASH_CMD_UNLOCK, FLASH_UNLOCK_CODE0, FLASH_UNLOCK_CODE1 };
+
+		printf("umi_touch: recover: the unlock was %s\n",
+		    fts_write_bytes(unlock, sizeof(unlock)) ? "acknowledged" : "not acknowledged");
+		sleep_ms(50);
+		recover_page("after the unlock");
+	}
+}
+
 /* The interrupt line read as an input with its pull-up on: only the chip can pull it low. */
 static bool
-int_line(void)
-{
+int_line(void){
 	gpio_configure(PIN_INT, 0, PULL_UP, 2, false);
 	sleep_us(200);
 	return gpio_get(PIN_INT);
@@ -3034,6 +3157,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t pinswap = 0;
 	uint32_t flasharg = 0;
 	uint32_t burnarg = 0;
+	uint32_t recoverarg = 0;
 	uint32_t eventsarg = 0;
 	uint32_t shapesarg = 0;
 	uint32_t searg = 0;
@@ -3069,6 +3193,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	intmon = intmonarg != 0;
 	PE_parse_boot_argn("umi_touch_flash", &flasharg, sizeof(flasharg));
 	PE_parse_boot_argn("umi_touch_burn", &burnarg, sizeof(burnarg));
+	PE_parse_boot_argn("umi_touch_recover", &recoverarg, sizeof(recoverarg));
 	PE_parse_boot_argn("umi_touch_events", &eventsarg, sizeof(eventsarg));
 	PE_parse_boot_argn("umi_touch_shapes", &shapesarg, sizeof(shapesarg));
 	PE_parse_boot_argn("umi_touch_se", &searg, sizeof(searg));
@@ -3124,7 +3249,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
 	if (sup || proto || bitsweep || scan8 || intmon || flasharg || burnarg ||
-	    eventsarg || shapesarg || searg || hwi2carg) {
+	    eventsarg || shapesarg || searg || hwi2carg || recoverarg) {
 		power_up();
 	}
 	/*
@@ -3189,6 +3314,17 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	if (burnarg) {
 		i2c_bus_recover();
 		flash_burn();
+		thread_terminate(current_thread());
+		return;
+	}
+	/*
+	 * umi_touch_recover=1: see recover_sweep(). Every reset order and settle time a boot rom
+	 * could be waiting for, in one run, each ending with the same question -- the chip id -- so
+	 * that one log either finds the combination or rules all of them out.
+	 */
+	if (recoverarg) {
+		i2c_bus_recover();
+		recover_sweep();
 		thread_terminate(current_thread());
 		return;
 	}
