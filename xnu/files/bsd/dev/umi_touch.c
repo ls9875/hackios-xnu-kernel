@@ -46,6 +46,8 @@
  *   umi_touch_stage=N   stop early and say so: 1 read the pins and nothing else, 2 also reset
  *                       the chip and read its ID, 9 (the default) run the polling loop
  *   umi_touch_gpio=0xN  put every pin at N + 0x1000 * pin, over the tile table below
+ *   umi_touch_pushpull=1  drive the high half of the clock rather than waiting for a pull-up,
+ *                       for a board whose pull-ups are not powered in this boot environment
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -248,6 +250,20 @@ static unsigned pin_sda = PIN_SDA, pin_scl = PIN_SCL;
 static uint32_t bit_us = 3;         /* a half clock; about 150 kHz with 3 */
 
 /*
+ * umi_touch_pushpull=1 drives the high half of the clock instead of letting a pull-up do it.
+ *
+ * It is not how I2C is meant to work: the point of open drain is that the slave can pull a line
+ * down while the master holds it up, and here both would drive. It is here because this pair has
+ * no working pull-up in this boot environment -- released, with the pull field set to each of its
+ * four values in turn, both lines sit at 0 within 200 us -- so the only high level the bit-bang
+ * ever produces is one it drives itself. Contention is limited to the acknowledge bit of each
+ * byte and to a 2 mA driver, which is the price of finding out whether the chip is there at all:
+ * if it talks this way it is powered and the fault is the pull-ups; if it does not, nothing is
+ * driving that pair and the chip has no supply.
+ */
+static bool pushpull;
+
+/*
  * Where the bring-up is, one line per step. A run that stops leaves its last line behind, so
  * "no chip ID" stops being one uninformative silence and becomes a place -- which is the only
  * way to find anything from a log when the alternative is a phone that says nothing at all.
@@ -264,7 +280,11 @@ trace(const char *what)
 static void
 line_release(unsigned pin)
 {
-	gpio_configure(pin, 0, PULL_UP, 2, false);
+	if (pushpull) {
+		gpio_output(pin, true, PULL_NONE, 2);
+	} else {
+		gpio_configure(pin, 0, PULL_UP, 2, false);
+	}
 }
 
 static void
@@ -704,7 +724,7 @@ poll_report(void)
 static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, reg = 0, one = 0;
+	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, reg = 0, one = 0, pp = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -716,6 +736,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_flip", &flip, sizeof(flip));
 	PE_parse_boot_argn("umi_touch_stage", &stage, sizeof(stage));
 	PE_parse_boot_argn("umi_touch_gpio", &one, sizeof(one));
+	PE_parse_boot_argn("umi_touch_pushpull", &pp, sizeof(pp));
+	pushpull = pp != 0;
 	if (poll_us < 250 || poll_us > 100000) {
 		poll_us = 8000;
 	}
@@ -732,6 +754,9 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	printf("umi_touch: tlmm west %#x south %#x north %#x; gpio%u..%u and gpio%u are in south\n",
 	    (uint32_t)TLMM_WEST, (uint32_t)TLMM_SOUTH, (uint32_t)TLMM_NORTH, PIN_SDA, PIN_INT, PIN_AVDD);
+	if (pushpull) {
+		printf("umi_touch: driving the high half of the clock instead of waiting for a pull-up\n");
+	}
 
 	show_pins("as found");
 	if (stage <= 1) {
