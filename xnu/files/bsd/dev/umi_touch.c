@@ -2716,12 +2716,138 @@ full_scan(void)
 			    address, found);
 		}
 	}
-	uint64_t elapsed_ms = (mach_absolute_time() - began) / 1000000ULL;
+	/*
+	 * Raw ticks, not milliseconds: this kernel has no timebase conversion for absolutes, and a
+	 * number that is labelled honestly is worth more than a converted one that is wrong. It is
+	 * only ever compared against other runs of this same loop.
+	 */
+	uint64_t elapsed = mach_absolute_time() - began;
 
-	printf("umi_touch: fullscan: %u non-zero byte%s in 65536 addresses, %u ms\n",
-	    found, found == 1 ? "" : "s", (unsigned)elapsed_ms);
+	printf("umi_touch: fullscan: %u non-zero byte%s in 65536 addresses, %llu ticks\n",
+	    found, found == 1 ? "" : "s", elapsed);
 	if (found > printed) {
 		printf("umi_touch: fullscan: %u more not printed\n", found - printed);
+	}
+}
+
+/*
+ * The plainest read the part can be asked for: some command bytes, then as many bytes back as
+ * asked, with nothing assumed about what the command means. fts_readCmd, in the same shape.
+ */
+static bool
+fts_read_cmd(const uint8_t *cmd, uint32_t cmdlen, uint8_t *data, uint32_t length)
+{
+	bool ok;
+
+	i2c_start();
+	ok = i2c_write_byte((uint8_t)(bus_address << 1));
+	for (uint32_t i = 0; ok && i < cmdlen; i++) {
+		ok = i2c_write_byte(cmd[i]);
+	}
+	if (ok) {
+		i2c_start();
+		ok = i2c_write_byte((uint8_t)(bus_address << 1 | 1));
+		if (ok) {
+			for (uint32_t i = 0; i < length; i++) {
+				data[i] = i2c_read_byte(i + 1 < length);
+			}
+		}
+	}
+	i2c_stop();
+	return ok;
+}
+
+/*
+ * umi_touch_romscan=1: will this part return one non-zero byte to anything at all?
+ *
+ * Every read this driver has ever made came back zero, and zero is the *correct* answer in the two
+ * places it has been checked: 0x85 returns 0x00 because the event fifo is empty (EVENTID_NO_EVENT
+ * is 0x00, ftsSoftware.h), and the loader's 0xF9 00 returns 0x00 because bit 7 clear means ready
+ * (ftsFlash.c:wait_for_flash_ready). So "the chip answers zero" and "the bus moves no data" are
+ * the same picture, and whether this port can move data at all hangs on telling them apart.
+ *
+ * The boot rom is the one part of that chip which is certainly running, because it is what
+ * acknowledges the address. This walks every read-register type the loader has -- 256 of them,
+ * which is the width of the type field -- under both framings, then tries the shape with no
+ * command byte in it at all: address, read bit, straight into the byte. A single non-zero answer
+ * anywhere settles the question in the useful direction, because it means the zeros are real data
+ * and the part simply has no application running. All zeros everywhere says the opposite, and the
+ * next move is the hardware controller rather than more reading.
+ */
+static void
+rom_scan(void)
+{
+	static const char *names[] = {
+		"0xF9 <type>, repeated start",
+		"0xF9 <type>, stop then start",
+	};
+
+	for (unsigned variant = 0; variant < 2; variant++) {
+		unsigned answered = 0, failed = 0, nonzero = 0;
+
+		printf("umi_touch: --- the boot rom, %s ---\n", names[variant]);
+		for (unsigned type = 0; type < 256; type++) {
+			uint8_t cmd[2] = { FLASH_CMD_READ_REGISTER, (uint8_t)type };
+			uint8_t value = 0;
+
+			if (variant == 1) {
+				bool ok;
+
+				i2c_start();
+				ok = i2c_write_byte((uint8_t)(bus_address << 1));
+				for (unsigned i = 0; ok && i < sizeof(cmd); i++) {
+					ok = i2c_write_byte(cmd[i]);
+				}
+				i2c_stop();
+				i2c_start();
+				if (ok && i2c_write_byte((uint8_t)(bus_address << 1 | 1))) {
+					value = i2c_read_byte(false);
+					answered++;
+				} else {
+					failed++;
+				}
+				i2c_stop();
+			} else if (fts_read_cmd(cmd, sizeof(cmd), &value, 1)) {
+				answered++;
+			} else {
+				failed++;
+			}
+			if (value != 0) {
+				nonzero++;
+				printf("umi_touch: rom: 0xF9 %02x = %02x\n", type, value);
+			}
+		}
+		printf("umi_touch: rom: %u of 256 answered, %u did not, %u non-zero\n",
+		    answered, failed, nonzero);
+	}
+
+	/* the shape with no command byte in it: address, read bit, one byte back */
+	{
+		uint8_t bare = 0;
+		bool got = false;
+
+		i2c_start();
+		if (i2c_write_byte((uint8_t)(bus_address << 1 | 1))) {
+			bare = i2c_read_byte(false);
+			got = true;
+		}
+		i2c_stop();
+		printf("umi_touch: rom: a read with no command byte: %s %02x\n",
+		    got ? "answered" : "nothing", bare);
+	}
+
+	/* and how often the address itself is acknowledged, over 256 tries */
+	{
+		unsigned acks = 0;
+
+		for (unsigned i = 0; i < 256; i++) {
+			i2c_start();
+			if (i2c_write_byte((uint8_t)(bus_address << 1))) {
+				acks++;
+			}
+			i2c_stop();
+		}
+		printf("umi_touch: rom: %u of 256 address writes acknowledged\n", acks);
 	}
 }
 
@@ -3300,6 +3426,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t hwi2carg = 0;
 	uint32_t quietarg = 0;
 	uint32_t fullarg = 0;
+	uint32_t romarg = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -3338,6 +3465,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_hwi2c", &hwi2carg, sizeof(hwi2carg));
 	PE_parse_boot_argn("umi_touch_quiet", &quietarg, sizeof(quietarg));
 	PE_parse_boot_argn("umi_touch_fullscan", &fullarg, sizeof(fullarg));
+	PE_parse_boot_argn("umi_touch_romscan", &romarg, sizeof(romarg));
 	/*
 	 * umi_touch_pinswap=1: the two lines the other way round, for every path in this file.
 	 *
@@ -3409,7 +3537,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
 	if (sup || proto || bitsweep || scan8 || intmon || flasharg || burnarg ||
-	    eventsarg || shapesarg || searg || hwi2carg || recoverarg || fullarg) {
+	    eventsarg || shapesarg || searg || hwi2carg || recoverarg || fullarg || romarg) {
 		power_up();
 	}
 	/*
@@ -3485,6 +3613,18 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	if (fullarg) {
 		i2c_bus_recover();
 		full_scan();
+		thread_terminate(current_thread());
+		return;
+	}
+	/*
+	 * umi_touch_romscan=1: see rom_scan(). Will the part return one non-zero byte to anything --
+	 * 256 loader register types under two framings, a read with no command byte in it, and an
+	 * acknowledgement count -- which is the only thing that separates "answers zero" from
+	 * "moves no data" when zero is a legitimate answer in both places it has been seen.
+	 */
+	if (romarg) {
+		i2c_bus_recover();
+		rom_scan();
 		thread_terminate(current_thread());
 		return;
 	}
