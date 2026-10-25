@@ -48,6 +48,7 @@
  *   umi_touch_gpio=0xN  put every pin at N + 0x1000 * pin, over the tile table below
  *   umi_touch_pushpull=1  drive the high half of the clock rather than waiting for a pull-up,
  *                       for a board whose pull-ups are not powered in this boot environment
+ *   umi_touch_cmd_db=1  print what RPMh can switch, with the address of each, and stop
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -721,10 +722,76 @@ poll_report(void)
 	parse_report(report);
 }
 
+/* ---- what RPMh can switch (dt: reserved-memory cmd_db@80860000) ---------------------------------- */
+
+/*
+ * The touch controller is not answering, and with a real high level on both lines rather than a
+ * pull-up that is not there, that means no acknowledge rather than a misread one. The panel's
+ * overlay gives fts@49 avdd-supply = pm8150_s4 in one variant and pm8150_s5 in another -- PMIC
+ * SMPS rails, not the gpio-gated disp_vddio switch this driver already reads high. Nothing in
+ * this port votes a PMIC regulator yet, so the rail is off.
+ *
+ * The boot loader leaves a list of everything RPMh can switch, with the address each one is
+ * switched at (RPMh's own cmd-db, which redwood_adreno.c reads the same way for gfx.lvl and
+ * cx.lvl). Printing it is read-only and says which of those rails exist and where, before any
+ * run decides to raise one.
+ */
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+
+#define CMD_DB_PHYS              0x80860000UL
+#define CMD_DB_SIZE              0x20000UL
+
+struct cmd_db_slave {
+	uint16_t id, header_offset, data_offset, count, version, reserved[3];
+};
+struct cmd_db_header {
+	uint32_t version;
+	uint8_t magic[4];
+	struct cmd_db_slave slave[8];
+	uint32_t checksum, reserved;
+	uint8_t data[];
+};
+struct cmd_db_entry {
+	char id[8];
+	uint32_t priority[2];
+	uint32_t address;
+	uint16_t length, offset;
+};
+
+static void
+dump_cmd_db(void)
+{
+	const struct cmd_db_header *db;
+
+	db = (const struct cmd_db_header *)ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);
+	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
+		printf("umi_touch: cmd_db at %#x has no magic (%02x %02x %02x %02x)\n",
+		    (uint32_t)CMD_DB_PHYS, db->magic[0], db->magic[1], db->magic[2], db->magic[3]);
+		return;
+	}
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &db->slave[s];
+		const struct cmd_db_entry *entry;
+
+		if (slave->id == 0 || slave->count == 0 || slave->count > 512) {
+			continue;
+		}
+		printf("umi_touch: cmd_db slave %u (id %u): %u entries\n", s, slave->id, slave->count);
+		entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
+		for (unsigned i = 0; i < slave->count; i++) {
+			char id[9];
+
+			memcpy(id, entry[i].id, 8);
+			id[8] = 0;
+			printf("umi_touch:   %-8s %#010x  %u bytes\n", id, entry[i].address, entry[i].length);
+		}
+	}
+}
+
 static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, reg = 0, one = 0, pp = 0;
+	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, reg = 0, one = 0, pp = 0, cd = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -738,6 +805,11 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_gpio", &one, sizeof(one));
 	PE_parse_boot_argn("umi_touch_pushpull", &pp, sizeof(pp));
 	pushpull = pp != 0;
+	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
+		dump_cmd_db();
+		thread_terminate(current_thread());
+		return;
+	}
 	if (poll_us < 250 || poll_us > 100000) {
 		poll_us = 8000;
 	}
