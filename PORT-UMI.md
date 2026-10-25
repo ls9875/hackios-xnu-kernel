@@ -162,17 +162,60 @@ with `cpus` left at its default gives it one, and every run since has returned c
 a phone that needs the power button — which is why `bootcpu=7` matters more here than it does on
 redwood, where the same watchdog would have caught the hang.
 
+## Touch
+
+umi's touch controller is an ST FocalTech part the vendor calls `st,fts`, on I2C bus 3 at
+address 0x49 — the `3-0049` that shows up under `/sys/bus/i2c/devices` on Android, and the
+`fts` device (`/dev/input/event5`) in its input device list. None of that is in the base
+device tree: the bus is `soc/i2c@a94000` with `status=disabled`, and the whole touch node
+arrives in a dtbo overlay. The one that applies is `overlay-17.dtbo` entry 2 — the only
+entry carrying `compatible = "st,fts"`; the others carry `focaltech,fts` over SPI, which is
+a different panel variant.
+
+What the overlay's `fragment@111` and the base tree give, together:
+
+| | |
+|---|---|
+| bus | `qupv3_se13_i2c` = `soc/i2c@a94000`, `qcom,i2c-geni`, reg `0xa94000` size `0x4000` |
+| pins | `qupv3_se13_i2c_active`: gpio36, gpio37, function `qup13` |
+| reset | `fts,reset-gpio = <gpio38 0>`, muxed as a plain GPIO by `pmx_ts_active` |
+| interrupt | `fts,irq-gpio = <gpio39 0x2008>`, low while a report waits |
+| power | `avdd-supply` → `touch_vddio_vreg` (`disp_vddio_vreg`), enable gpio69, active high |
+| panel | `fts,x-max` 1080, `fts,y-max` 2340, `focaltech,max-touch-number` 10 |
+
+`overlay-17.dtbo`'s `__fixups__` is what pins the bus down: `qupv3_se13_i2c` appears there
+against `fragment@111:target:0`, and `fragment@111` is the one whose `__overlay__` carries
+`qcom,i2c-touch-active = "st,fts"` and the `fts@49` child. Matching each `i2c@` node's
+`pinctrl-0` phandle back to its pinctrl group gives the same answer independently: only
+`i2c@a94000` points at `qupv3_se13_i2c_active`.
+
+`bsd/dev/umi_touch.c` drives it, behind boot-arg `umi_touch=1`. The serial engine itself is
+not used: its I2C protocol firmware is loaded by whoever configures engine 13 for I2C, and
+nothing on this boot path does — the loader brings up the display and USB and nothing
+else. So gpio36 and gpio37 are reconfigured as GPIOs and I2C is bit-banged on them, open
+drain. That needs no clock, no DMA and no engine, and the register protocol is plain —
+write the address, repeat the start, read the bytes — with none of the FTS 5.x SPI framing
+(7-byte header, dummy bytes, CRC-16/Kermit) that `redwood_goodix.c` carries for the same
+chip family over SPI.
+
+Which of gpio36/gpio37 is SDA is not written down anywhere, and the wrong way round is not
+an error the chip can report: it simply sees no valid start condition. The driver tries
+both and keeps the one that answers.
+
+Because the first run is the one that has to say what the chip is, the driver is loud:
+`umi_touch_diag=1` reads all 256 registers a byte at a time and prints the map, and the
+first four reports are printed raw before they are parsed.
+
 ## Not done yet
 
-- **Touch, buttons, battery, GPU.** The kernel's device code is still redwood's. The log names the
+- **Touch: written, not yet proven on the phone.** See "Touch" above. `umi_touch=1` is in
+  `umi.conf`; the first run with `umi_touch_diag=1` should say whether the chip answers.
+- **Buttons, battery, GPU.** The kernel's device code is still redwood's. The log names the
   gaps plainly: `redwood: battery: SOC=-1% battery=0` (PMIC not driven), `redwood: input: the event
-  server asks for property "..." which we do not have` (the HID service is incomplete and there is
-  no touch driver at all, so the home screen cannot be poked), `redwood: SpringBoard: no GPU draws,
-  vibrant views are plain` (software rendering). The Weather and Calendar widgets are blank for the
-  same reason plus no network.
-- **No touch driver.** umi is an ST Focaltech part on GENI I2C SE13 (`3-0049`); the kernel in this
-  tree has redwood's Goodix GT9916 over bit-banged SPI. `BOOTARGS` in `umi.conf` therefore leaves
-  `touchscreen=1` out. `docs/PORTING.md` §3 lists what the other redwood-specific kernel drivers
+  server asks for property "..." which we do not have` (the HID service is incomplete),
+  `redwood: SpringBoard: no GPU draws, vibrant views are plain` (software rendering). The
+  Weather and Calendar widgets are blank for the same reason plus no network.
+  `docs/PORTING.md` §3 lists what the other redwood-specific kernel drivers
   (buttons, CPU frequency, watchdog, GPU, Wi-Fi, audio) each need to become umi's.
 - **No firmware.** No GPU, Wi-Fi, audio or haptics blobs are fetched, so there is software rendering
   only and no network.

@@ -48,8 +48,9 @@ Rebuild with `xnuloader/build.sh`; QEMU must still pick `qemu-virt` (no match = 
 What is generic: GICv3, the timer, PSCI SMP, the display (the UEFI's framebuffer), APFS and ramfs, the driver
 replacements, the return-to-loader path. What is redwood-specific and needs looking at:
 
-- **touch**: `bsd/dev/redwood_goodix.c` (Goodix GT9916 over bit-banged SPI) — another panel needs its own driver
-  feeding `/dev/redwood-touch` (`bsd/dev/redwood_input.c`);
+- **touch**: `bsd/dev/redwood_goodix.c` (Goodix GT9916 or FocalTech FT3680 over bit-banged SPI) — another
+  panel needs its own driver feeding `/dev/redwood-touch` (`bsd/dev/redwood_input.c`). umi's is
+  `bsd/dev/umi_touch.c` (ST FocalTech over I2C, the pins driven by hand); see PORT-UMI.md "Touch";
 - **buttons, CPU frequency, watchdog**: GPIO/PMIC numbers and the EPSS block in `redwood_input.c`,
   `redwood_cpufreq.c`, `osfmk/arm64/loader_return.c`;
 - **GPU / Wi-Fi / sound**: `redwood_adreno.c` (Adreno 642L), `redwood_wifi.c` (WCN6750 + ath11k), `redwood_audio.c`

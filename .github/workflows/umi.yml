@@ -108,19 +108,14 @@ jobs:
           test -x "$THEOS/toolchain/linux/iphone/bin/clang"
           test -x "$THEOS/toolchain/linux/iphone/bin/ld"
 
-      # xnu/README.md was written against clang 22; the distribution's is older. Take the
-      # newest the LLVM project packages, so the kernel sees the compiler it was tested with.
-      - name: A clang of this decade (apt.llvm.org)
+      # xnu/README.md was written against clang 22; the distribution's is 18, which is the closer
+      # match to a 2023 kernel anyway (xnu-clang drops the flags only Apple's clang knows).
+      # apt.llvm.org is not used: for noble it carries only clang-24, which is too new for this
+      # XNU. Say which one is in play, so a failure names the compiler.
+      - name: Clang
         run: |
-          . /etc/os-release
-          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc >/dev/null
-          echo "deb http://apt.llvm.org/$VERSION_CODENAME/ llvm-toolchain-$VERSION_CODENAME main" \
-            | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq clang-21 lld-21
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 200
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 200
           clang --version | head -1
+          clang -dumpversion
 
       # iPhoneOS16.5.sdk is what the kernel is compiled against; it is in the current release
       # of github.com/theos/sdks. Read the tag through the API rather than hard-coding it.
