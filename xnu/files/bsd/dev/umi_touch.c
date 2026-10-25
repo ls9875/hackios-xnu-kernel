@@ -2515,6 +2515,14 @@ recover_sweep(void)
 
 	printf("umi_touch: --- recover: the ways a boot rom could be waiting ---\n");
 
+	/*
+	 * 0. before any of them: what the chip says with nothing having been done to it. Every
+	 * variation below starts by pulsing or cycling something, so if the part were already
+	 * running -- rails up from the boot loader, no reset since -- this is the only line in
+	 * the whole run that would show it.
+	 */
+	recover_page("before anything is touched");
+
 	/* 1. how long the application takes, if an application is coming up at all */
 	for (unsigned i = 0; i < sizeof(settles) / sizeof(settles[0]); i++) {
 		gpio_output(PIN_RESET, false, PULL_NONE, 2);
@@ -2618,6 +2626,102 @@ recover_sweep(void)
 		}
 		printf("umi_touch: recover: the watch saw %u distinct answer%s in twenty seconds\n",
 		    changes, changes == 1 ? "" : "s");
+	}
+}
+
+/*
+ * umi_touch_quiet=1: read the chip in whatever state it is already in, and change nothing.
+ *
+ * Every run so far has opened by writing something -- a rail, a reset line, a pad config -- and
+ * every run has been judged on what the chip answered afterwards. But `fastboot boot` does not
+ * power-cycle the SoC, so the state at the start of a run is the state the previous run left, and
+ * the only clean starting point in the whole history of this port is the moment just after Android
+ * has been running the vendor driver: rails up, core running, firmware live, reset released. If
+ * the chip answers anything at all, it answers there, and no experiment before this one has ever
+ * looked before it started interfering.
+ *
+ * So: print the pad registers as found, mux only the two bus lines (nothing else can be read
+ * without that), and then ask for the id ten times over two seconds, saying only what changes.
+ * No rail is written, no reset is pulsed, gpio69 is not touched.
+ */
+static void
+quiet_probe(void)
+{
+	uint8_t last[2] = { 0xff, 0xff };
+	unsigned changes = 0;
+
+	printf("umi_touch: --- quiet: the chip as somebody else left it ---\n");
+	printf("umi_touch: quiet: cfg as found sda %#x scl %#x reset %#x int %#x avdd %#x boost %#x vci %#x\n",
+	    rd(GPIO_CFG(PIN_SDA)), rd(GPIO_CFG(PIN_SCL)), rd(GPIO_CFG(PIN_RESET)),
+	    rd(GPIO_CFG(PIN_INT)), rd(GPIO_CFG(PIN_AVDD)), rd(GPIO_CFG(PIN_VBOOST)),
+	    rd(GPIO_CFG(PIN_VCI)));
+	printf("umi_touch: quiet: level as found sda %u scl %u reset %u int %u avdd %u boost %u vci %u\n",
+	    gpio_get(PIN_SDA), gpio_get(PIN_SCL), gpio_get(PIN_RESET), gpio_get(PIN_INT),
+	    gpio_get(PIN_AVDD), gpio_get(PIN_VBOOST), gpio_get(PIN_VCI));
+	/* the bus lines have to become GPIOs, or there is no bit-bang at all; nothing else does */
+	line_release(PIN_SDA);
+	line_release(PIN_SCL);
+	sleep_us(200);
+	printf("umi_touch: quiet: level after the mux sda %u scl %u\n",
+	    gpio_get(PIN_SDA), gpio_get(PIN_SCL));
+	for (unsigned i = 0; i < 10; i++) {
+		uint8_t id[2] = { 0, 0 };
+
+		(void)fts_read_registers(FTS_CHIP_ID_ADDR_A, id, 2);
+		if (id[0] != last[0] || id[1] != last[1]) {
+			printf("umi_touch: quiet: at %u ms: id %02x %02x int %u\n",
+			    i * 200, id[0], id[1], gpio_get(PIN_INT));
+			last[0] = id[0];
+			last[1] = id[1];
+			changes++;
+		}
+		sleep_ms(200);
+	}
+	printf("umi_touch: quiet: %u distinct answer%s in two seconds\n",
+	    changes, changes == 1 ? "" : "s");
+	recover_page("quiet, at the end");
+}
+
+/*
+ * umi_touch_fullscan=1: every one of the 65536 sixteen-bit register addresses, read once.
+ *
+ * The map has only ever been sampled, never swept: 256 addresses 8-bit and eight windows of 256
+ * 16-bit, which is about three percent of the space and none of it chosen for any reason beyond
+ * the vendor's own defines. "The register file is not there" is a conclusion about 2048 addresses.
+ * A byte at a time over the whole space costs about forty seconds on this boot, and it either
+ * finds the map or makes the conclusion true.
+ */
+static void
+full_scan(void)
+{
+	unsigned found = 0, printed = 0;
+	uint64_t began = mach_absolute_time();
+
+	printf("umi_touch: --- full scan: 65536 addresses, one byte each ---\n");
+	for (uint32_t address = 0; address < 0x10000; address++) {
+		uint8_t value = 0;
+
+		if (!fts_read_registers((uint16_t)address, &value, 1)) {
+			continue;
+		}
+		if (value != 0) {
+			found++;
+			if (printed < 48) {
+				printf("umi_touch: fullscan: %04x = %02x\n", address, value);
+				printed++;
+			}
+		}
+		if ((address & 0x1fff) == 0x1fff) {
+			printf("umi_touch: fullscan: ... %04x done, %u non-zero so far\n",
+			    address, found);
+		}
+	}
+	uint64_t elapsed_ms = (mach_absolute_time() - began) / 1000000ULL;
+
+	printf("umi_touch: fullscan: %u non-zero byte%s in 65536 addresses, %u ms\n",
+	    found, found == 1 ? "" : "s", (unsigned)elapsed_ms);
+	if (found > printed) {
+		printf("umi_touch: fullscan: %u more not printed\n", found - printed);
 	}
 }
 
@@ -3194,6 +3298,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t shapesarg = 0;
 	uint32_t searg = 0;
 	uint32_t hwi2carg = 0;
+	uint32_t quietarg = 0;
+	uint32_t fullarg = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -3230,6 +3336,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_shapes", &shapesarg, sizeof(shapesarg));
 	PE_parse_boot_argn("umi_touch_se", &searg, sizeof(searg));
 	PE_parse_boot_argn("umi_touch_hwi2c", &hwi2carg, sizeof(hwi2carg));
+	PE_parse_boot_argn("umi_touch_quiet", &quietarg, sizeof(quietarg));
+	PE_parse_boot_argn("umi_touch_fullscan", &fullarg, sizeof(fullarg));
 	/*
 	 * umi_touch_pinswap=1: the two lines the other way round, for every path in this file.
 	 *
@@ -3274,6 +3382,15 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 
 	show_pins("as found");
 	/*
+	 * umi_touch_quiet=1: read first, write nothing. It has to come before power_up(), because
+	 * power_up() is exactly the interference this run exists to avoid.
+	 */
+	if (quietarg) {
+		quiet_probe();
+		thread_terminate(current_thread());
+		return;
+	}
+	/*
 	 * umi_touch_supply=1: put the board back the way Android leaves it, in the order the hardware
 	 * wants, before anything is measured. power_up() is the whole of it and says what is known and
 	 * what is guessed, rail by rail; the short version is that ldoc1 is the 1.8 V this pair hangs
@@ -3281,7 +3398,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
 	if (sup || proto || bitsweep || scan8 || intmon || flasharg || burnarg ||
-	    eventsarg || shapesarg || searg || hwi2carg || recoverarg) {
+	    eventsarg || shapesarg || searg || hwi2carg || recoverarg || fullarg) {
 		power_up();
 	}
 	/*
@@ -3346,6 +3463,17 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	if (burnarg) {
 		i2c_bus_recover();
 		flash_burn();
+		thread_terminate(current_thread());
+		return;
+	}
+	/*
+	 * umi_touch_fullscan=1: all 65536 register addresses, read once each. See full_scan() -- the
+	 * map has only ever been sampled, and "the register file is not there" was a statement about
+	 * three percent of the space.
+	 */
+	if (fullarg) {
+		i2c_bus_recover();
+		full_scan();
 		thread_terminate(current_thread());
 		return;
 	}
