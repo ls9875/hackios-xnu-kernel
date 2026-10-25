@@ -1069,9 +1069,14 @@ flash_fill(uint32_t address_words, const uint8_t *data, uint32_t size)
 			printf("umi_touch: flash: the dma burst at %u did not complete\n", wheel);
 			return false;
 		}
-		if ((wheel & 7) == 7) {
-			printf("umi_touch: flash: %u of %u bytes written\n", size - remaining, size);
-		}
+		/*
+		 * Every read this driver takes comes back zero, so the ready poll above cannot be
+		 * distinguished from "ready at once". A burst that is still being programmed when the
+		 * next one lands would leave the flash holding a mixture of two images, which is worse
+		 * than not writing at all -- so give the part time that no reading here can confirm.
+		 */
+		sleep_ms(20);
+		printf("umi_touch: flash: %u of %u bytes written\n", size - remaining, size);
 		wheel++;
 	}
 	return true;
