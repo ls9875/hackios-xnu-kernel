@@ -51,6 +51,7 @@
  *   umi_touch_cmd_db=1  print what RPMh can switch, with the address of each, and stop
  *   umi_touch_scan=1    ask every address on the bus who is there, before anything else, and stop
  *   umi_touch_supply=1  ask RPMh for pm8150a_l1 (ldoc1, 1.8 V) before touching the bus
+ *   umi_touch_start=0   do not run the 0x55/0xAA start sequence before reading the chip ID
  *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
  *                       low, 2 does not touch it -- one of the three is the chip out of reset
  *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
@@ -118,6 +119,15 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define FTS_REG_CHIP_ID_HIGH     0xa3
 #define FTS_REG_CHIP_ID_LOW      0x9f
 #define FTS_REG_TOUCH_DATA       0x01
+
+/*
+ * Starting the chip: 0xAA written to register 0x55, 12 ms, then the boot ID at register 0x90.
+ * bsd/dev/redwood_goodix.c carries the same three numbers for the FT3680 (FTS_CMD_START1,
+ * FTS_CMD_START2, FTS_CMD_START_DELAY, FTS_CMD_READ_BOOT_ID) and expects 0x56 0x62 back.
+ */
+#define FTS_CMD_START_REGISTER   0x55
+#define FTS_CMD_START_VALUE      0xaa
+#define FTS_CMD_BOOT_ID          0x90
 #define FTS_MAX_TOUCHES          10      /* focaltech,max-touch-number */
 #define FTS_REPORT_LENGTH        (2 + 6 * FTS_MAX_TOUCHES)
 
@@ -129,6 +139,7 @@ static vm_offset_t tlmm_west, tlmm_south, tlmm_north;
 static vm_offset_t tlmm_one;            /* umi_touch_gpio: put every pin at this base instead */
 static uint32_t stage = 9;              /* umi_touch_stage */
 static uint32_t reset_mode = 1;         /* umi_touch_reset: the level the reset sequence settles at */
+static bool start_chip = true;          /* umi_touch_start: run the 0x55/0xAA sequence */
 
 /* Which tile a pin's registers live in, out of the table described above. */
 static vm_offset_t
@@ -704,6 +715,31 @@ probe(unsigned sda, unsigned scl, bool verbose)
 	if (verbose) {
 		trace("200 ms later");
 	}
+	/*
+	 * The chip does not answer at its ID registers until it has been started. Focaltech's own
+	 * sequence -- the one bsd/dev/redwood_goodix.c uses for the FT3680 over SPI -- is a write of
+	 * 0xAA to register 0x55, a 12 ms wait, then two bytes from register 0x90: the boot ID, which
+	 * is 0x56 0x62 for that family. A chip that has not been started answers there and nowhere
+	 * else, which is what the 256-register map looks like now that the bus is powered: four
+	 * non-zero bytes and 252 zeros.
+	 */
+	if (start_chip) {
+		static const uint8_t aa = FTS_CMD_START_VALUE;
+		uint8_t boot[2] = { 0, 0 };
+
+		if (i2c_write_registers(FTS_CMD_START_REGISTER, &aa, 1)) {
+			sleep_ms(12);
+			if (i2c_read_registers(FTS_CMD_BOOT_ID, boot, 2)) {
+				printf("umi_touch: boot ID at %#x: %02x %02x%s\n", FTS_CMD_BOOT_ID, boot[0], boot[1],
+				    (boot[0] == 0x56 && boot[1] == 0x62) ? " -- the Focaltech ROM answered" : "");
+			} else {
+				printf("umi_touch: no answer at the boot ID, %#x\n", FTS_CMD_BOOT_ID);
+			}
+		} else {
+			printf("umi_touch: could not write %#x to %#x to start the chip\n",
+			    FTS_CMD_START_VALUE, FTS_CMD_START_REGISTER);
+		}
+	}
 
 	for (int attempt = 0; attempt < 5; attempt++) {
 		if (verbose) {
@@ -1013,6 +1049,12 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	PE_parse_boot_argn("umi_touch_scan", &sc, sizeof(sc));
 	PE_parse_boot_argn("umi_touch_supply", &sup, sizeof(sup));
+	{
+		uint32_t start = 1;
+
+		PE_parse_boot_argn("umi_touch_start", &start, sizeof(start));
+		start_chip = start != 0;
+	}
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
