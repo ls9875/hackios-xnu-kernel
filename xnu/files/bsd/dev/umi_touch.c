@@ -2463,9 +2463,13 @@ power_up(void)
 		power_id("gpio12, 50 ms later");
 	}
 
-	gpio_output(PIN_RESET, false, PULL_NONE, 2);
-	sleep_ms(20);
-	gpio_output(PIN_RESET, true, PULL_NONE, 2);
+	if (reset_mode != 2) {
+		gpio_output(PIN_RESET, false, PULL_NONE, 2);
+		sleep_ms(20);
+		gpio_output(PIN_RESET, true, PULL_NONE, 2);
+	} else {
+		printf("umi_touch: power: umi_touch_reset=2 -- the reset line is left alone\n");
+	}
 	sleep_ms(settle_ms);
 	printf("umi_touch: power: out of reset: sda %u scl %u reset %u int %u\n",
 	    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_RESET), gpio_get(PIN_INT));
@@ -2586,6 +2590,34 @@ recover_sweep(void)
 		    fts_write_bytes(unlock, sizeof(unlock)) ? "acknowledged" : "not acknowledged");
 		sleep_ms(50);
 		recover_page("after the unlock");
+	}
+
+	/*
+	 * 7. and then simply watch. Every reading so far was taken within three seconds of a reset,
+	 * and how long an application takes to come up is not known from here. Twenty seconds of one
+	 * read every hundred milliseconds, saying only what changes, costs a boot and settles it: an
+	 * id that appears late is still an id, and a stream of zeros is a core that never arrives.
+	 */
+	printf("umi_touch: recover: watching the id for twenty seconds\n");
+	{
+		uint8_t last[2] = { 0xff, 0xff };
+		unsigned changes = 0;
+
+		for (unsigned i = 0; i < 200; i++) {
+			uint8_t id[2] = { 0, 0 };
+
+			(void)fts_read_registers(FTS_CHIP_ID_ADDR_A, id, 2);
+			if (id[0] != last[0] || id[1] != last[1]) {
+				printf("umi_touch: recover: watch %u ms: id %02x %02x\n",
+				    (unsigned)(i + 1) * 100, id[0], id[1]);
+				last[0] = id[0];
+				last[1] = id[1];
+				changes++;
+			}
+			sleep_ms(100);
+		}
+		printf("umi_touch: recover: the watch saw %u distinct answer%s in twenty seconds\n",
+		    changes, changes == 1 ? "" : "s");
 	}
 }
 
