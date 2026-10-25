@@ -52,6 +52,7 @@
  *   umi_touch_scan=1    ask every address on the bus who is there, before anything else, and stop
  *   umi_touch_supply=1  ask RPMh for pm8150a_l1 (ldoc1, 1.8 V) before touching the bus
  *   umi_touch_start=0   do not run the 0x55/0xAA start sequence before reading the chip ID
+ *   umi_touch_diff=1    read the whole map three times and print only what changes between
  *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
  *                       low, 2 does not touch it -- one of the three is the chip out of reset
  *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
@@ -809,6 +810,45 @@ register_dump(void)
 	}
 }
 
+/*
+ * Which registers of this chip are alive? Reading the whole map twice and printing only what
+ * changed answers that without knowing what any of it means: a chip whose core is running has
+ * counters and status bits that move on their own, and one that answers only from a bus-powered
+ * slave interface is frozen. The map this driver gets is four non-zero bytes out of 256, so the
+ * question worth asking is not what they are but whether anything moves at all.
+ */
+static void
+register_diff(void)
+{
+	static uint8_t before[256], after[256];
+
+	for (unsigned i = 0; i < 256; i++) {
+		before[i] = 0xff;
+		if (!i2c_read_registers((uint8_t)i, &before[i], 1)) {
+			before[i] = 0xfe;
+		}
+	}
+	for (int round = 1; round <= 3; round++) {
+		unsigned changed = 0;
+
+		sleep_ms(200);
+		for (unsigned i = 0; i < 256; i++) {
+			after[i] = 0xff;
+			if (!i2c_read_registers((uint8_t)i, &after[i], 1)) {
+				after[i] = 0xfe;
+			}
+		}
+		for (unsigned i = 0; i < 256; i++) {
+			if (before[i] != after[i]) {
+				printf("umi_touch:   %02x: %02x -> %02x\n", i, before[i], after[i]);
+				changed++;
+				before[i] = after[i];
+			}
+		}
+		printf("umi_touch: round %d: %u register(s) moved in 200 ms\n", round, changed);
+	}
+}
+
 static void
 poll_report(void)
 {
@@ -1050,6 +1090,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, reg = 0, one = 0, pp = 0, cd = 0;
 	uint32_t sc = 0;
 	uint32_t sup = 0;
+	uint32_t df = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -1076,6 +1117,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		PE_parse_boot_argn("umi_touch_start", &start, sizeof(start));
 		start_chip = start != 0;
 	}
+	PE_parse_boot_argn("umi_touch_diff", &df, sizeof(df));
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
@@ -1149,6 +1191,15 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	idle_looks = 80000 / poll_us;    /* a read every 80 ms even with the line high, in case it is missed */
 
+	if (df) {
+		pins_for_i2c();
+		gpio_set(PIN_RESET, reset_mode != 0);
+		sleep_ms(200);
+		printf("umi_touch: reading the map twice to see what moves\n");
+		register_diff();
+		thread_terminate(current_thread());
+		return;
+	}
 	/*
 	 * Which of gpio36/gpio37 is SDA and which is SCL is not written down anywhere, and the
 	 * wrong way round is not an error the chip can report: it simply sees no valid start
