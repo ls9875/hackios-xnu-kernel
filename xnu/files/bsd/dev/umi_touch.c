@@ -77,6 +77,14 @@
  *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
  *                       low, 2 does not touch it
  *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
+ *   umi_touch_se=1      read the serial engine at 0xa94000 -- its clock votes, its clock source,
+ *                       which protocol firmware it is running, its FIFO depth -- and stop. It
+ *                       answers whether the controller Android uses is even alive on this boot.
+ *   umi_touch_hwi2c=1   do the same register read through that engine instead of the bit-bang,
+ *                       with gpio36 and gpio37 muxed back to "qup13". This is the run that
+ *                       separates "the chip answers zeros" from "this driver cannot hear it":
+ *                       the engine reports completion, failure, and a refusal on an address
+ *                       nobody owns, none of which a hand-driven clock can tell you.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -2563,6 +2571,401 @@ event_probe(void)
 	}
 }
 
+/* ---- the serial engine at 0xa94000, as a hardware I2C master ----------------------------------- */
+
+/*
+ * Everything above drives gpio36 and gpio37 by hand. That is the one part of this driver that was
+ * never taken from anything: the wire timing, the acknowledge sampling, the clock stretching, all
+ * of it is this file's own reading of the I2C specification. The protocol on top of it is not --
+ * the register read is byte for byte what ftsIO.c:readCmdU16 sends (0xB6, address, repeated start,
+ * one dummy byte, data), the acknowledge is real (one address in 128 answers, and resetting the
+ * chip takes that away), and the chip's own core is running (it pulls its interrupt line down nine
+ * milliseconds after the reset goes high). Yet 2304 register addresses all answer 0x00, at seven
+ * clock rates, through four different framings. Whatever is wrong is below the protocol.
+ *
+ * So this section talks to the same pins through the controller that Android uses: serial engine
+ * 13, QUPv3 wrap 1 engine 5, at 0xa94000, with gpio36 and gpio37 muxed back to their "qup13"
+ * function. The register offsets below are not inferred: GENI comes from the upstream
+ * drivers/soc/qcom/geni-se.h and the I2C programming from drivers/i2c/busses/i2c-qcom-geni.c, and
+ * the clock offsets from drivers/clk/qcom/gcc-sm8250.c, where gcc_qupv3_wrap1_s5_clk_src has
+ * cmd_rcgr 0x18600 and gcc_qupv3_wrap1_s5_clk is enabled by bit 27 of the vote register at
+ * 0x52008 -- the same layout the POCO X5 Pro code found on its own clock controller.
+ *
+ * The engine also answers questions the bit-bang cannot. A transfer either completes or it does
+ * not: M_CMD_DONE plus the failure bits say which, and a read from an address nobody owns has to
+ * come back refused. That alone separates "the chip answers zeros" from "this driver cannot tell".
+ */
+
+#define GCC_PHYS                 0x00100000UL
+#define GCC_SIZE                 0x60000UL
+#define SE_PHYS                  0x00a94000UL
+#define SE_SIZE                  0x4000UL
+
+static vm_offset_t gcc_base, se_base;
+static uint32_t se_fifo_depth;
+static uint32_t se_last_status;
+
+#define GCC_QUP_VOTE             (gcc_base + 0x52008)   /* [18] core_2x [19] core [20] m_ahb [21] s_ahb [27] se5 */
+#define GCC_VOTE_CORE_2X         (1u << 18)
+#define GCC_VOTE_CORE            (1u << 19)
+#define GCC_VOTE_M_AHB           (1u << 20)
+#define GCC_VOTE_S_AHB           (1u << 21)
+#define GCC_VOTE_SE5             (1u << 27)
+#define GCC_QUP1_CORE_CBCR       (gcc_base + 0x23138)
+#define GCC_QUP1_CORE2X_CBCR     (gcc_base + 0x23140)
+#define GCC_QUP1_SE5_CBCR        (gcc_base + 0x185fc)
+#define GCC_QUP1_SE5_CMD         (gcc_base + 0x18600)   /* bit 0: take the new configuration */
+#define GCC_QUP1_SE5_CFG         (gcc_base + 0x18604)   /* [10:8] source, [4:0] divider, [13:12] mode */
+#define GCC_QUP1_SE5_DFS         (gcc_base + 0x18614)   /* bit 0: the engine picks preset rates itself */
+#define CLOCK_HALTED             (1u << 31)
+#define SE_SOURCE_HZ             19200000u              /* P_BI_TCXO */
+
+#define SE_REG(n)                (se_base + (n))
+#define GENI_FORCE_DEFAULT       SE_REG(0x020)
+#define GENI_OUTPUT_CTRL         SE_REG(0x024)
+#define GENI_CGC_CTRL            SE_REG(0x028)
+#define GENI_STATUS              SE_REG(0x040)          /* bit 0: a command is running */
+#define GENI_SER_M_CLK_CFG       SE_REG(0x048)          /* bit 0 enable, [15:4] divider */
+#define GENI_IF_DISABLE_RO       SE_REG(0x064)
+#define GENI_FW_REVISION_RO      SE_REG(0x068)          /* [15:8] protocol: 1 SPI, 2 UART, 3 I2C */
+#define GENI_CLK_SEL             SE_REG(0x07c)
+#define GENI_BYTE_GRAN           SE_REG(0x254)
+#define GENI_DMA_MODE_EN         SE_REG(0x258)
+#define GENI_TX_PACKING_CFG0     SE_REG(0x260)
+#define GENI_TX_PACKING_CFG1     SE_REG(0x264)
+#define SE_I2C_TX_TRANS_LEN      SE_REG(0x26c)
+#define SE_I2C_RX_TRANS_LEN      SE_REG(0x270)
+#define SE_I2C_SCL_COUNTERS      SE_REG(0x278)          /* [29:20] high, [19:10] low, [9:0] period */
+#define GENI_RX_PACKING_CFG0     SE_REG(0x284)
+#define GENI_RX_PACKING_CFG1     SE_REG(0x288)
+#define GENI_M_CMD0              SE_REG(0x600)          /* [31:27] operation, [15:9] slave address */
+#define GENI_M_CMD_CTRL          SE_REG(0x604)
+#define GENI_M_IRQ_STATUS        SE_REG(0x610)
+#define GENI_M_IRQ_EN            SE_REG(0x614)
+#define GENI_M_IRQ_CLEAR         SE_REG(0x618)
+#define GENI_S_IRQ_CLEAR         SE_REG(0x648)
+#define GENI_TX_FIFO             SE_REG(0x700)
+#define GENI_RX_FIFO             SE_REG(0x780)
+#define GENI_TX_FIFO_STATUS      SE_REG(0x800)          /* [27:0] words waiting */
+#define GENI_RX_FIFO_STATUS      SE_REG(0x804)          /* bit 31 last, [30:28] valid bytes, [24:0] words */
+#define GENI_TX_WATERMARK        SE_REG(0x80c)
+#define GENI_RX_WATERMARK        SE_REG(0x810)
+#define GENI_RX_RFR_WATERMARK    SE_REG(0x814)
+#define SE_GENI_IOS              SE_REG(0x908)          /* bit 0 data line, bit 1 the other one */
+#define SE_DMA_TX_IRQ_CLR        SE_REG(0xc44)
+#define SE_DMA_RX_IRQ_CLR        SE_REG(0xd44)
+#define SE_GSI_EVENT_EN          SE_REG(0xe18)
+#define SE_IRQ_EN                SE_REG(0xe1c)
+#define SE_HW_PARAM_0            SE_REG(0xe24)          /* [21:16] FIFO depth in words */
+#define SE_DMA_GENERAL_CFG       SE_REG(0xe30)
+
+#define SE_I2C_WRITE             0x1
+#define SE_I2C_READ              0x2
+#define I2C_STOP_STRETCH         (1u << 2)              /* hold the bus for the message after this one */
+#define I2C_SLV_ADDR(addr)       (((uint32_t)(addr) << 9) & 0xfe00)
+#define SE_OPCODE(op)            ((uint32_t)(op) << 27)
+
+#define SE_IRQ_DONE              (1u << 0)
+#define SE_IRQ_OVERRUN           (1u << 1)
+#define SE_IRQ_ILLEGAL           (1u << 2)
+#define SE_IRQ_FAILURE           (1u << 3)
+#define SE_IRQ_CANCEL            (1u << 4)
+#define SE_IRQ_ABORT             (1u << 5)
+#define SE_IRQ_ERRORS            (SE_IRQ_OVERRUN | SE_IRQ_ILLEGAL | SE_IRQ_FAILURE)
+
+static bool
+se_map(void)
+{
+	if (!gcc_base) {
+		gcc_base = ml_io_map(GCC_PHYS, GCC_SIZE);
+	}
+	if (!se_base) {
+		se_base = ml_io_map(SE_PHYS, SE_SIZE);
+	}
+	if (!gcc_base || !se_base) {
+		printf("umi_touch: cannot map the clock controller (%#x) or the engine (%#x)\n",
+		    (uint32_t)gcc_base, (uint32_t)se_base);
+		return false;
+	}
+	return true;
+}
+
+static void
+se_dump(const char *when)
+{
+	printf("umi_touch: [%s] votes %#x core %#x core2x %#x se5 %#x\n", when,
+	    rd(GCC_QUP_VOTE), rd(GCC_QUP1_CORE_CBCR), rd(GCC_QUP1_CORE2X_CBCR), rd(GCC_QUP1_SE5_CBCR));
+	printf("umi_touch: [%s] rcg cmd %#x cfg %#x dfs %#x | fw revision %#x (protocol %u) if disable %#x hw param0 %#x\n",
+	    when, rd(GCC_QUP1_SE5_CMD), rd(GCC_QUP1_SE5_CFG), rd(GCC_QUP1_SE5_DFS),
+	    rd(GENI_FW_REVISION_RO), rd(GENI_FW_REVISION_RO) >> 8 & 0xff, rd(GENI_IF_DISABLE_RO),
+	    rd(SE_HW_PARAM_0));
+	printf("umi_touch: [%s] clk sel %#x ser m clk %#x scl counters %#x | status %#x ios %#x cmd0 %#x irq %#x\n",
+	    when, rd(GENI_CLK_SEL), rd(GENI_SER_M_CLK_CFG), rd(SE_I2C_SCL_COUNTERS),
+	    rd(GENI_STATUS), rd(SE_GENI_IOS), rd(GENI_M_CMD0), rd(GENI_M_IRQ_STATUS));
+	printf("umi_touch: [%s] gpio%u %#x gpio%u %#x\n", when, PIN_SDA, rd(GPIO_CFG(PIN_SDA)),
+	    PIN_SCL, rd(GPIO_CFG(PIN_SCL)));
+}
+
+/*
+ * The three clocks the engine needs, voted for and waited for. The rate is the crystal with no
+ * divider: source 0 of this controller is bi_tcxo (see gcc_parent_map_0), a divider field of zero
+ * divides by one, and no m/n/d pair is involved, so the configuration register wants a plain 0.
+ */
+static bool
+se_clocks_on(void)
+{
+	uint32_t state;
+
+	wr(GCC_QUP_VOTE, rd(GCC_QUP_VOTE) | GCC_VOTE_CORE_2X | GCC_VOTE_CORE | GCC_VOTE_M_AHB |
+	    GCC_VOTE_S_AHB);
+	/* whichever way the bootloader left it, the rate below is this code's choice, not a preset */
+	if (rd(GCC_QUP1_SE5_DFS) & 1) {
+		wr(GCC_QUP1_SE5_DFS, rd(GCC_QUP1_SE5_DFS) & ~1u);
+	}
+	wr(GCC_QUP1_SE5_CFG, 0);
+	wr(GCC_QUP1_SE5_CMD, rd(GCC_QUP1_SE5_CMD) | 1);
+	for (int i = 0; i < 500 && (rd(GCC_QUP1_SE5_CMD) & 1); i++) {
+		sleep_us(10);
+	}
+	if (rd(GCC_QUP1_SE5_CMD) & 1) {
+		printf("umi_touch: the engine's clock source will not take its configuration (%#x)\n",
+		    rd(GCC_QUP1_SE5_CMD));
+		return false;
+	}
+	wr(GCC_QUP_VOTE, rd(GCC_QUP_VOTE) | GCC_VOTE_SE5);
+	for (int i = 0; i < 1000; i++) {
+		state = rd(GCC_QUP1_CORE_CBCR) | rd(GCC_QUP1_CORE2X_CBCR) | rd(GCC_QUP1_SE5_CBCR);
+		if (!(state & CLOCK_HALTED)) {
+			return true;
+		}
+		sleep_us(10);
+	}
+	printf("umi_touch: the clocks stay off: core %#x core2x %#x se5 %#x\n", rd(GCC_QUP1_CORE_CBCR),
+	    rd(GCC_QUP1_CORE2X_CBCR), rd(GCC_QUP1_SE5_CBCR));
+	return false;
+}
+
+/*
+ * Eight bits per transfer word, four words per FIFO entry, least significant byte first. The two
+ * packing registers are the halves of one table of four vectors, each vector being {start bit,
+ * direction, length - 1} at bits [9:5], [4] and [3:1] within its ten-bit slot; the last vector
+ * carries the stop bit. For eight-bit words that is 0x0e, 0x10e, 0x20e, 0x30f, packed two to a
+ * register at a ten-bit stride. See geni_se_config_packing().
+ */
+static const char *
+se_init_i2c(void)
+{
+	uint32_t protocol;
+
+	if (!se_map() || !se_clocks_on()) {
+		return "the clocks are not there";
+	}
+	protocol = rd(GENI_FW_REVISION_RO) >> 8 & 0xff;
+	if (protocol != 3) {
+		printf("umi_touch: the engine runs protocol %u, not I2C (3)\n", protocol);
+		return "the engine has no I2C firmware";
+	}
+	if (rd(GENI_IF_DISABLE_RO) & 1) {
+		return "the engine's FIFO interface is disabled";
+	}
+	se_fifo_depth = rd(SE_HW_PARAM_0) >> 16 & 0x3f;
+	if (se_fifo_depth < 4) {
+		printf("umi_touch: the engine reports a FIFO depth of %u\n", se_fifo_depth);
+		return "no FIFO";
+	}
+	wr(SE_GSI_EVENT_EN, 0);
+	wr(GENI_M_IRQ_CLEAR, 0xffffffff);
+	wr(GENI_S_IRQ_CLEAR, 0xffffffff);
+	wr(SE_DMA_TX_IRQ_CLR, 0xffffffff);
+	wr(SE_DMA_RX_IRQ_CLR, 0xffffffff);
+	wr(GENI_CGC_CTRL, rd(GENI_CGC_CTRL) | 0x7f);
+	wr(SE_DMA_GENERAL_CFG, rd(SE_DMA_GENERAL_CFG) | 0xf);
+	wr(GENI_OUTPUT_CTRL, 0x7f);
+	wr(GENI_FORCE_DEFAULT, 1);
+	wr(GENI_DMA_MODE_EN, rd(GENI_DMA_MODE_EN) & ~1u);
+	wr(GENI_RX_WATERMARK, se_fifo_depth - 3);
+	wr(GENI_RX_RFR_WATERMARK, se_fifo_depth - 2);
+	wr(GENI_TX_WATERMARK, 0);
+	wr(SE_IRQ_EN, rd(SE_IRQ_EN) | 0xf);
+	wr(GENI_M_IRQ_EN, rd(GENI_M_IRQ_EN) | 0x7fc0007f);
+	wr(GENI_TX_PACKING_CFG0, 0x0004380eu);
+	wr(GENI_TX_PACKING_CFG1, 0x000c3e0eu);
+	wr(GENI_RX_PACKING_CFG0, 0x0004380eu);
+	wr(GENI_RX_PACKING_CFG1, 0x000c3e0eu);
+	wr(GENI_BYTE_GRAN, 0);
+	wr(GENI_CLK_SEL, 0);
+	wr(GENI_SER_M_CLK_CFG, (7u << 4) | 1u);                 /* 19.2 MHz / 8 = 2.4 MHz */
+	wr(SE_I2C_SCL_COUNTERS, (10u << 20) | (12u << 10) | 26u);   /* about 100 kHz */
+	return NULL;
+}
+
+static bool
+se_wait_done(void)
+{
+	uint64_t deadline;
+
+	clock_interval_to_deadline(500000, NSEC_PER_USEC, &deadline);
+	for (;;) {
+		se_last_status = rd(GENI_M_IRQ_STATUS);
+		if (se_last_status & (SE_IRQ_DONE | SE_IRQ_CANCEL | SE_IRQ_ABORT | SE_IRQ_ERRORS)) {
+			break;
+		}
+		if (mach_absolute_time() >= deadline) {
+			printf("umi_touch: the engine did not finish in 500 ms\n");
+			break;
+		}
+		sleep_us(20);
+	}
+	wr(GENI_M_IRQ_CLEAR, se_last_status);
+	return (se_last_status & SE_IRQ_DONE) && !(se_last_status & SE_IRQ_ERRORS);
+}
+
+/* `stretch` holds the bus after these bytes so the read that follows is a repeated start. */
+static bool
+se_i2c_write(uint8_t address, const uint8_t *tx, uint32_t length, bool stretch)
+{
+	uint32_t sent = 0;
+	uint64_t deadline;
+
+	wr(SE_I2C_TX_TRANS_LEN, length);
+	wr(GENI_M_IRQ_CLEAR, 0xffffffff);
+	wr(GENI_M_CMD0, SE_OPCODE(SE_I2C_WRITE) | (stretch ? I2C_STOP_STRETCH : 0) |
+	    I2C_SLV_ADDR(address));
+	clock_interval_to_deadline(500000, NSEC_PER_USEC, &deadline);
+	while (sent < length) {
+		uint32_t queued = rd(GENI_TX_FIFO_STATUS) & 0x0fffffff;
+		uint32_t take = length - sent, word = 0;
+
+		if (queued >= se_fifo_depth) {
+			if (mach_absolute_time() >= deadline) {
+				printf("umi_touch: the transmit FIFO will not drain (%u of %u in)\n",
+				    sent, length);
+				return false;
+			}
+			sleep_us(20);
+			continue;
+		}
+		if (take > 4) {
+			take = 4;
+		}
+		for (uint32_t i = 0; i < take; i++) {
+			word |= (uint32_t)tx[sent + i] << (8 * i);
+		}
+		wr(GENI_TX_FIFO, word);
+		sent += take;
+	}
+	return se_wait_done();
+}
+
+static bool
+se_i2c_read(uint8_t address, uint8_t *rx, uint32_t length)
+{
+	wr(SE_I2C_RX_TRANS_LEN, length);
+	wr(GENI_M_IRQ_CLEAR, 0xffffffff);
+	wr(GENI_M_CMD0, SE_OPCODE(SE_I2C_READ) | I2C_SLV_ADDR(address));
+	if (!se_wait_done()) {
+		return false;
+	}
+	/* the bytes stay in the FIFO once the command is done, four to a word */
+	for (uint32_t word = 0; word < (length + 3) / 4; word++) {
+		uint32_t value = rd(GENI_RX_FIFO);
+
+		for (uint32_t i = 0; i < 4; i++) {
+			if (word * 4 + i < length) {
+				rx[word * 4 + i] = (uint8_t)(value >> (8 * i));
+			}
+		}
+	}
+	return true;
+}
+
+/* The register read of ftsIO.c:readCmdU16, with the engine doing the wire work. */
+static bool
+se_read_registers(uint16_t address, uint8_t *data, uint32_t length, bool stretch)
+{
+	uint8_t command[3] = { FTS_CMD_HW_REG, (uint8_t)(address >> 8), (uint8_t)(address & 0xff) };
+	uint8_t dummy[FTS_FIFO_DEPTH + 1];
+
+	if (length + 1 > sizeof(dummy)) {
+		return false;
+	}
+	if (!se_i2c_write(bus_address, command, sizeof(command), stretch)) {
+		printf("umi_touch: the engine would not send the address for %#06x (irq %#x)\n",
+		    address, se_last_status);
+		return false;
+	}
+	if (!se_i2c_read(bus_address, dummy, length + 1)) {
+		printf("umi_touch: the engine would not read %#06x back (irq %#x)\n", address,
+		    se_last_status);
+		return false;
+	}
+	memcpy(data, dummy + 1, length);
+	return true;
+}
+
+static void
+hw_i2c_probe(void)
+{
+	static const char *framing[] = { "repeated start", "stopped write" };
+	const char *why;
+
+	printf("umi_touch: --- the serial engine at %#x as an I2C master ---\n", (uint32_t)SE_PHYS);
+	se_dump("before");
+	why = se_init_i2c();
+	printf("umi_touch: engine setup: %s\n", why ? why : "ok");
+	se_dump("after");
+	if (why) {
+		return;
+	}
+	/*
+	 * gpio36 and gpio37 go back to their "qup13" function, which is function 1 in the pin table
+	 * of pinctrl-sm8250.c -- there is no GPIO between them and the engine any more.
+	 */
+	gpio_configure(PIN_SDA, 1, PULL_UP, 2, false);
+	gpio_configure(PIN_SCL, 1, PULL_UP, 2, false);
+	printf("umi_touch: gpio%u muxed to %#x, gpio%u muxed to %#x\n", PIN_SDA,
+	    rd(GPIO_CFG(PIN_SDA)), PIN_SCL, rd(GPIO_CFG(PIN_SCL)));
+
+	for (unsigned variant = 0; variant < 2; variant++) {
+		uint8_t id[2] = { 0, 0 };
+		uint8_t page[8];
+		bool ok;
+
+		ok = se_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id), variant == 0);
+		printf("umi_touch: %u %-15s id at %#06x: %s %02x %02x\n", variant,
+		    framing[variant], FTS_CHIP_ID_ADDR_A, ok ? "read" : "fail", id[0], id[1]);
+		memset(page, 0, sizeof(page));
+		ok = se_read_registers(0x0000, page, sizeof(page), variant == 0);
+		printf("umi_touch: %u %-15s 0000: %s %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		    variant, framing[variant], ok ? "read" : "fail", page[0], page[1], page[2],
+		    page[3], page[4], page[5], page[6], page[7]);
+	}
+	{
+		uint8_t version[2] = { 0, 0 };
+		bool ok = se_read_registers(FTS_FW_VER_ADDR_A, version, sizeof(version), true);
+
+		printf("umi_touch: fw version at %#06x: %s %02x %02x\n", FTS_FW_VER_ADDR_A,
+		    ok ? "read" : "fail", version[0], version[1]);
+	}
+	/*
+	 * The control: 0x50 is nobody. If this answers as readily as 0x49 did, then a refusal is
+	 * not something this engine can express and every acknowledge this driver ever saw should
+	 * be distrusted; if it is refused, the engine is measuring the bus and 0x49 is a real chip.
+	 */
+	for (unsigned i = 0; i < 2; i++) {
+		uint8_t address = i ? bus_address : 0x50;
+		bool ok;
+
+		wr(SE_I2C_TX_TRANS_LEN, 0);
+		wr(GENI_M_IRQ_CLEAR, 0xffffffff);
+		wr(GENI_M_CMD0, SE_OPCODE(SE_I2C_WRITE) | I2C_SLV_ADDR(address));
+		ok = se_wait_done();
+		printf("umi_touch: a zero-length write to %#x: %s, irq %#x\n", address,
+		    ok ? "accepted" : "refused", se_last_status);
+	}
+	se_dump("end");
+}
+
 static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -2582,6 +2985,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t burnarg = 0;
 	uint32_t eventsarg = 0;
 	uint32_t shapesarg = 0;
+	uint32_t searg = 0;
+	uint32_t hwi2carg = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -2615,6 +3020,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_burn", &burnarg, sizeof(burnarg));
 	PE_parse_boot_argn("umi_touch_events", &eventsarg, sizeof(eventsarg));
 	PE_parse_boot_argn("umi_touch_shapes", &shapesarg, sizeof(shapesarg));
+	PE_parse_boot_argn("umi_touch_se", &searg, sizeof(searg));
+	PE_parse_boot_argn("umi_touch_hwi2c", &hwi2carg, sizeof(hwi2carg));
 	/*
 	 * umi_touch_pinswap=1: the two lines the other way round, for every path in this file.
 	 *
@@ -2666,8 +3073,32 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
 	if (sup || proto || bitsweep || scan8 || intmon || flasharg || burnarg ||
-	    eventsarg || shapesarg) {
+	    eventsarg || shapesarg || searg || hwi2carg) {
 		power_up();
+	}
+	/*
+	 * umi_touch_se=1: read the serial engine's own registers and nothing else. It says whether
+	 * the engine at 0xa94000 is clocked at all, which firmware it is running, and how deep its
+	 * FIFO is -- three things that decide whether umi_touch_hwi2c=1 can work.
+	 */
+	if (searg) {
+		if (se_map()) {
+			se_dump("as found");
+			(void)se_clocks_on();
+			se_dump("clocks voted");
+		}
+		thread_terminate(current_thread());
+		return;
+	}
+	/*
+	 * umi_touch_hwi2c=1: the same register read through the controller Android uses, with the
+	 * pins handed back to qup13. See hw_i2c_probe() -- this is the run that decides whether the
+	 * zeros are the chip's answer or this driver's inability to hear it.
+	 */
+	if (hwi2carg) {
+		hw_i2c_probe();
+		thread_terminate(current_thread());
+		return;
 	}
 	/*
 	 * umi_touch_shapes=1: the four ways to frame a register read, side by side. It comes first
