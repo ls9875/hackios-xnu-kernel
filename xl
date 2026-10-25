@@ -104,13 +104,23 @@ enter() {
 	esac
 	xnuloader/mkpayload.py -o usb-payload.bin loader.efi=$L --usb >/dev/null &&
 		./mkxnuimg.py -p usb-payload.bin -o xnu-usb.img >/dev/null || { echo "xl: image build failed"; return 1; }
-	# Right after the phone enters fastboot the first "boot" is sometimes not taken: try twice.
+	# The first "boot" after the phone has just entered fastboot is often not taken, and on umi
+	# it is not taken in a specific way: the same image that boots fine is refused with
+	# "Failed to load/authenticate boot image: Load Error", and is then accepted once fastboot
+	# itself has been restarted. So a rejected boot is retried from a fresh fastboot rather
+	# than from the same one -- a plain second try against the same fastboot fails identically.
 	local try
 	for try in 1 2; do
-		FB_TIMEOUT=40 fb boot xnu-usb.img | grep -q OKAY || { sleep 3; continue; }
+		FB_TIMEOUT=40 fb boot xnu-usb.img | grep -q OKAY || {
+			FB_TIMEOUT=40 fb reboot bootloader >/dev/null 2>&1
+			wait_for fastboot 60
+			continue
+		}
 		sleep 6
 		wait_for loader 30 && return 0
 		[ "$(state)" = fastboot ] || break
+		FB_TIMEOUT=40 fb reboot bootloader >/dev/null 2>&1
+		wait_for fastboot 60
 	done
 	echo "xl: loader did not come up on USB (state: $(state))"; return 1
 }

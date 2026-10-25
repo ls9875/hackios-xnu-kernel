@@ -227,6 +227,19 @@ show_pins(const char *when)
 static unsigned pin_sda = PIN_SDA, pin_scl = PIN_SCL;
 static uint32_t bit_us = 3;         /* a half clock; about 150 kHz with 3 */
 
+/*
+ * Where the bring-up is, one line per step. A run that stops leaves its last line behind, so
+ * "no chip ID" stops being one uninformative silence and becomes a place -- which is the only
+ * way to find anything from a log when the alternative is a phone that says nothing at all.
+ */
+static void
+trace(const char *what)
+{
+	printf("umi_touch: ... %s: sda %#x/%u scl %#x/%u reset %#x/%u\n", what,
+	    rd(GPIO_CFG(pin_sda)), gpio_get(pin_sda), rd(GPIO_CFG(pin_scl)), gpio_get(pin_scl),
+	    rd(GPIO_CFG(PIN_RESET)), gpio_get(PIN_RESET));
+}
+
 /* A line is open drain: released is an input with the pull-up on, pulled down is an output. */
 static void
 line_release(unsigned pin)
@@ -508,15 +521,36 @@ probe(unsigned sda, unsigned scl, bool verbose)
 
 	pin_sda = sda;
 	pin_scl = scl;
+	if (verbose) {
+		trace("one try, sda and scl as given");
+	}
 	pins_for_i2c();
+	if (verbose) {
+		trace("the two lines open drain, reset held low");
+	}
 	i2c_bus_recover();
+	if (verbose) {
+		trace("the bus looked at");
+	}
 
 	gpio_set(PIN_RESET, false);
 	sleep_ms(2);
+	if (verbose) {
+		trace("2 ms in reset");
+	}
 	gpio_set(PIN_RESET, true);
+	if (verbose) {
+		trace("out of reset");
+	}
 	sleep_ms(200);                    /* the vendor's fts_reset_proc, then time to boot the app */
+	if (verbose) {
+		trace("200 ms after reset");
+	}
 
 	for (int attempt = 0; attempt < 5; attempt++) {
+		if (verbose) {
+			trace("asking who it is");
+		}
 		if (read_chip_id(&high, &low)) {
 			if (high != 0xff || low != 0xff) {
 				if (verbose) {
@@ -527,6 +561,9 @@ probe(unsigned sda, unsigned scl, bool verbose)
 			}
 		} else {
 			seen.no_ack++;
+			if (verbose) {
+				printf("umi_touch: ... attempt %d: no acknowledge\n", attempt + 1);
+			}
 		}
 		sleep_ms(50);
 	}
