@@ -54,11 +54,19 @@
  *                       for a board whose pull-ups are not powered in this boot environment
  *   umi_touch_cmd_db=1  print what RPMh can switch, with the address of each, and stop
  *   umi_touch_scan=1    ask every address on the bus who is there, before anything else, and stop
- *   umi_touch_supply=1  ask RPMh for pm8150a_l1 (ldoc1, 1.8 V) and for pm8150_s4 (smpa4, the
- *                       part's avdd) before touching the bus
+ *   umi_touch_supply=1  put the board back the way Android leaves it before touching the bus:
+ *                       smpa4 on (undoing an earlier pcycle run), then ldoc1 on -- the 1.8 V this
+ *                       pair's pull-ups hang from, proved by run 152817 -- then gpio69, the
+ *                       switch in front of it, then a reset pulse
+ *   umi_touch_proto=1   the chip acknowledges its address and returns zero for every register:
+ *                       read the ID through sixteen opcodes, dump the whole 256-byte map, and
+ *                       write/read-back sixteen addresses, to tell a wrong opcode from a core
+ *                       that is not running. Stops after.
  *   umi_touch_pcycle=1  switch smpa4 off and back on with the reset held low, then send the
  *                       rom's warm boot: the only thing that clears state a previous run left
  *                       behind, because `fastboot boot` never power-cycles the SoC. Stops after.
+ *                       It does not put smpa4 back -- umi_touch_supply=1 does, and every run
+ *                       after 214827 opened with the bus clamped because nothing did.
  *   umi_touch_diff=1    read the whole map three times and print only what changes between
  *   umi_touch_wtest=1   read the ID and the firmware version five times, then stop: a stable
  *                       pair proves the dummy byte is being dropped in the right place
@@ -574,6 +582,45 @@ fts_read_registers(uint16_t address, uint8_t *data, uint32_t length)
 	i2c_start();
 	if (i2c_write_byte((uint8_t)(bus_address << 1)) &&
 	    i2c_write_byte(FTS_CMD_HW_REG) &&
+	    i2c_write_byte((uint8_t)(address >> 8)) &&
+	    i2c_write_byte((uint8_t)(address & 0xff))) {
+		i2c_start();
+		if (i2c_write_byte((uint8_t)(bus_address << 1 | 1))) {
+			for (uint32_t i = 0; i <= length; i++) {
+				buf[i] = i2c_read_byte(i < length);
+			}
+			memcpy(data, buf + 1, length);
+			ok = true;
+		}
+	}
+	i2c_stop();
+	return ok;
+}
+
+/*
+ * The same read with the opcode spelled out.
+ *
+ * Every other function in here assumes 0xB6 is the opcode that means "hardware register", because
+ * ftsHardware.h says so and it is the same byte for reading and writing. That assumption is one of
+ * the two things that can make a live chip look dead: a slave acknowledges *any* byte sent to its
+ * address, so a wrong opcode is not a failure at the electrical level -- it is a command the chip
+ * does not understand, answered with zeros. "Acknowledges its address and returns zeros to
+ * everything" is exactly what this chip has done on a healthy bus, and a wrong opcode is the only
+ * explanation for that which does not require the chip to be broken. So the opcode becomes a
+ * parameter, and protocol_scan() walks a table of them.
+ */
+static bool
+fts_read_raw(uint8_t op, uint16_t address, uint8_t *data, uint32_t length)
+{
+	uint8_t buf[FTS_FIFO_DEPTH + 1];
+	bool ok = false;
+
+	if (length > sizeof(buf) - 1) {
+		return false;
+	}
+	i2c_start();
+	if (i2c_write_byte((uint8_t)(bus_address << 1)) &&
+	    i2c_write_byte(op) &&
 	    i2c_write_byte((uint8_t)(address >> 8)) &&
 	    i2c_write_byte((uint8_t)(address & 0xff))) {
 		i2c_start();
@@ -1125,6 +1172,116 @@ static bool panel_supply_on(const char *name);   /* pm8150_s4 / smpa4, defined w
 static bool panel_supply_off(const char *name);
 
 /*
+ * The chip answers its address and returns zero for everything. Two explanations survive; this
+ * function tells them apart.
+ *
+ *   (a) The opcode is wrong. A slave acknowledges any byte sent to its address, so 0xB6 being the
+ *       wrong "read a hardware register" command for this part looks exactly like a dead part:
+ *       no error anywhere, zeros for data. Xiaomi's part is an ST FingerTipS (st_fts_j2.ftb), but
+ *       the header the constants came from is one vendor's build of that driver, not this phone's.
+ *   (b) The core is not running. The I/O ring is powered from the 1.8 V the pair's pull-ups hang
+ *       from -- ldoc1, proved by run 152817, where asking RPMh for that rail alone took sda and
+ *       scl from 0 to 1 with no pin was touched -- and a part in that state acknowledges its
+ *       address while every register reads zero.
+ *
+ * A first answer to (a) is cheap: the same register read through sixteen opcodes. A first answer
+ * to (b) is cheaper still: the whole 256-byte register file, because a core that is running has
+ * *something* non-zero in it somewhere. Then a write and a read-back at sixteen addresses, because
+ * a register file that reads zero everywhere and also refuses writes is not a register file.
+ */
+static void
+protocol_scan(void)
+{
+	/*
+	 * 0xb6 is the vendor header's value. The rest are its neighbours, the framebuffer opcode, the
+	 * FIFO opcodes, and the two "page select" style bytes other ST parts use. Anything that comes
+	 * back non-zero is the answer; if all sixteen return zero, the opcode is not the problem.
+	 */
+	static const uint8_t opcodes[] = {
+		0xb6, 0xb7, 0xb5, 0xb4, 0xd0, 0xd1, 0xc0, 0xc1,
+		0x80, 0x86, 0x90, 0xa0, 0xb0, 0xe0, 0x5a, 0x4b,
+	};
+	uint8_t data[8];
+
+	printf("umi_touch: --- is the acknowledge ours? 0x48 must stay silent ---\n");
+	printf("umi_touch:   0x48: %s\n", i2c_address_present(0x48) ? "ACKNOWLEDGES" : "silent");
+	printf("umi_touch:   0x49: %s\n", i2c_address_present(0x49) ? "acknowledges" : "SILENT");
+
+	printf("umi_touch: --- the id register through sixteen opcodes ---\n");
+	for (unsigned i = 0; i < sizeof(opcodes); i++) {
+		memset(data, 0, sizeof(data));
+		if (!fts_read_raw(opcodes[i], FTS_CHIP_ID_ADDR_A, data, 4)) {
+			printf("umi_touch: op %02x: the address or a command byte was not acknowledged\n",
+			    opcodes[i]);
+			continue;
+		}
+		printf("umi_touch: op %02x: %02x %02x %02x %02x   sda %u scl %u\n", opcodes[i],
+		    data[0], data[1], data[2], data[3], gpio_get(pin_sda), gpio_get(pin_scl));
+	}
+
+	printf("umi_touch: --- the whole register file, 0x00..0xff, eight bytes a group ---\n");
+	for (unsigned row = 0; row < 0x100; row += 32) {
+		printf("umi_touch: %04x:", row);
+		for (unsigned i = 0; i < 32; i += 8) {
+			memset(data, 0, sizeof(data));
+			(void)fts_read_raw(FTS_CMD_HW_REG, (uint16_t)(row + i), data, 8);
+			printf(" %02x%02x%02x%02x%02x%02x%02x%02x",
+			    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+		}
+		printf("\n");
+	}
+
+	/*
+	 * A register that reads zero and also refuses a write is not a register. Sixteen addresses
+	 * across the map, each written with 0x5a and read straight back -- the read-back is what makes
+	 * it a test: if even one address holds the value, the register file is there and the problem
+	 * is which addresses this chip uses.
+	 */
+	printf("umi_touch: --- write 0x5a and read it back, sixteen addresses ---\n");
+	for (unsigned address = 0x0000; address < 0x0100; address += 0x10) {
+		uint8_t want = 0x5a;
+		uint8_t back[2] = { 0, 0 };
+
+		if (!fts_write_registers((uint16_t)address, &want, 1)) {
+			printf("umi_touch: %04x: the write was not acknowledged\n", address);
+			continue;
+		}
+		if (!fts_read_registers((uint16_t)address, back, 1)) {
+			printf("umi_touch: %04x: written, the read was not acknowledged\n", address);
+			continue;
+		}
+		printf("umi_touch: %04x <- 5a, read back %02x %s\n", address, back[0],
+		    back[0] == want ? "<- it stuck" : "");
+	}
+
+	/*
+	 * The interrupt line has been low in every run: by the vendor driver's reading that means the
+	 * chip has an event queued. Sense-on is the command that starts the panel scan; if the core is
+	 * running at all, either the FIFO answers or the interrupt line moves.
+	 */
+	printf("umi_touch: --- sense on, then the fifo ---\n");
+	printf("umi_touch: command %02x: %s\n", FTS_CMD_SENSE_ON,
+	    fts_command(FTS_CMD_SENSE_ON) ? "acknowledged" : "not acknowledged");
+	sleep_ms(50);
+	printf("umi_touch: after sense on: int %u\n", gpio_get(PIN_INT));
+	for (unsigned i = 0; i < 4; i++) {
+		uint8_t event[FTS_EVENT_SIZE];
+
+		if (!fts_read_event(event)) {
+			printf("umi_touch: fifo read not acknowledged\n");
+			break;
+		}
+		printf("umi_touch: fifo %u: %02x %02x %02x %02x %02x %02x %02x %02x\n", i,
+		    event[0], event[1], event[2], event[3], event[4], event[5], event[6], event[7]);
+		if (event[0] == EVENTID_NO_EVENT) {
+			break;
+		}
+	}
+	printf("umi_touch: at the end: sda %u scl %u int %u\n",
+	    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_INT));
+}
+
+/*
  * Everything the read path could still have wrong, in one boot.
  *
  * The command byte, the 16-bit address and one dummy byte are what the vendor driver does, and with
@@ -1626,6 +1783,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t wt = 0;
 	uint32_t sw = 0;
 	uint32_t pc = 0;
+	uint32_t proto = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -1650,6 +1808,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_settle_ms", &settle_ms, sizeof(settle_ms));
 	PE_parse_boot_argn("umi_touch_sweep", &sw, sizeof(sw));
 	PE_parse_boot_argn("umi_touch_pcycle", &pc, sizeof(pc));
+	PE_parse_boot_argn("umi_touch_proto", &proto, sizeof(proto));
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
@@ -1674,25 +1833,62 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 
 	show_pins("as found");
 	/*
-	 * umi_touch_supply=1: ask RPMh for both rails before anything else. ldoc1 is the 1.8 V the
-	 * pair's pull-ups are said to hang from; smpa4 is pm8150_s4, the part's own avdd. Asking for
-	 * only the first was asking for the one that does not exist, and it is why every read on
-	 * this bus came back 00 00 with an acknowledge.
+	 * umi_touch_supply=1: put the board back the way Android leaves it, in the order the hardware
+	 * wants, before anything is measured.
+	 *
+	 * ldoc1 (pm8150a_l1) is the rail this pair and the part's I/O ring hang from, and that is not
+	 * a guess any more: run 152817 asked RPMh for that one rail and nothing else, and sda, scl and
+	 * reset went from reading 0 to reading 1 without a single pin being touched. It is also why
+	 * every run since has opened with the bus clamped -- the rail is off after a `fastboot boot`,
+	 * the chip's esd diodes hold both lines at about 0.6 V, and every read then returns zeros with
+	 * what looks like an acknowledge on every byte, because a line held low *is* an acknowledge.
+	 *
+	 * smpa4 (pm8150_s4) is not the part's supply -- the overlay's avdd-supply is a local phandle
+	 * to touch_vddio_vreg, the gpio69 switch, and pm8150_s4 in the base tree is Wi-Fi's
+	 * vdd-wlan-io-supply. It is asked for here anyway, and that is not a leftover: run 214827
+	 * turned it off with umi_touch_pcycle=3 and the bus has been clamped in every run since,
+	 * across reboots, because `fastboot boot` does not power-cycle the SoC. Turning it back on is
+	 * how that is undone. It stays at its normal 1.8 V either way.
+	 *
+	 * gpio69 (touch_vddio_vreg, "disp_vddio_vreg") is the switch in front of ldoc1, and only then
+	 * does the part get a reset pulse.
 	 */
 	if (sup) {
 		rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
-		printf("umi_touch: asking RPMh for the bus supply: %s\n",
+		printf("umi_touch: putting smpa4 back (a previous run turned it off): %s\n",
+		    panel_supply_on("smpa4") ? "done" : "refused or timed out");
+		sleep_ms(10);
+		printf("umi_touch: ldoc1, the 1.8 V this pair hangs from: %s\n",
 		    bus_supply_on() ? "done" : "refused or timed out");
 		sleep_ms(20);
-		show_pins("with the bus supply asked for");
-		printf("umi_touch: asking RPMh for avdd: %s\n",
-		    panel_supply_on("smpa4") ? "done" : "refused or timed out");
-		sleep_ms(5);
+		show_pins("with ldoc1 on");
+		printf("umi_touch: gpio%u, the switch in front of it: %#x/%u, driving it high\n",
+		    PIN_AVDD, rd(GPIO_CFG(PIN_AVDD)), gpio_get(PIN_AVDD));
+		gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+		sleep_ms(20);
+		show_pins("with the switch on");
 		gpio_output(PIN_RESET, false, PULL_NONE, 2);
 		sleep_ms(20);
 		gpio_output(PIN_RESET, true, PULL_NONE, 2);
 		sleep_ms(settle_ms);
-		show_pins("with avdd asked for and the chip out of reset");
+		show_pins("out of reset");
+	}
+	/*
+	 * umi_touch_proto=1: the chip acknowledges its address and returns zero for every register.
+	 * This is the run that decides whether that is a wrong opcode or a core that is not running;
+	 * see protocol_scan(). The pins are set up and the chip is taken out of reset first, because
+	 * pins_for_i2c() holds reset low on purpose.
+	 */
+	if (proto) {
+		pins_for_i2c();
+		gpio_output(PIN_RESET, true, PULL_NONE, 2);
+		sleep_ms(settle_ms);
+		i2c_bus_recover();
+		printf("umi_touch: the pair before the scan: sda %u scl %u int %u\n",
+		    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_INT));
+		protocol_scan();
+		thread_terminate(current_thread());
+		return;
 	}
 	/*
 	 * umi_touch_scan=1: who is on this bus at all, with the reset held one way and then the
