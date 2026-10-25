@@ -54,6 +54,7 @@
  *   umi_touch_start=0   do not run the 0x55/0xAA start sequence before reading the chip ID
  *   umi_touch_diff=1    read the whole map three times and print only what changes between
  *   umi_touch_wtest=1   write a byte to three registers and read it back, then stop
+ *   umi_touch_settle_ms=N  how long the chip gets between the reset and the first read (200)
  *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
  *                       low, 2 does not touch it -- one of the three is the chip out of reset
  *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
@@ -142,6 +143,7 @@ static vm_offset_t tlmm_one;            /* umi_touch_gpio: put every pin at this
 static uint32_t stage = 9;              /* umi_touch_stage */
 static uint32_t reset_mode = 1;         /* umi_touch_reset: the level the reset sequence settles at */
 static bool start_chip = true;          /* umi_touch_start: run the 0x55/0xAA sequence */
+static uint32_t settle_ms = 200;        /* umi_touch_settle_ms: how long the chip gets after reset */
 
 /* Which tile a pin's registers live in, out of the table described above. */
 static vm_offset_t
@@ -734,7 +736,7 @@ probe(unsigned sda, unsigned scl, bool verbose)
 	} else if (verbose) {
 		trace("reset left where it was");
 	}
-	sleep_ms(200);                    /* the vendor's fts_reset_proc, then time to boot the app */
+	sleep_ms(settle_ms);              /* the vendor's fts_reset_proc, then time to boot the app */
 	if (verbose) {
 		trace("200 ms later");
 	}
@@ -1149,6 +1151,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	PE_parse_boot_argn("umi_touch_diff", &df, sizeof(df));
 	PE_parse_boot_argn("umi_touch_wtest", &wt, sizeof(wt));
+	PE_parse_boot_argn("umi_touch_settle_ms", &settle_ms, sizeof(settle_ms));
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
