@@ -994,40 +994,189 @@ write_test(void)
 }
 
 /*
- * The parts of the protocol that could still be wrong, tried in one boot, one line each.
+ * A register read that keeps the bytes it would normally throw away, and says how many it dropped.
  *
- * The command byte, the 16-bit address and the dummy byte are fixed by the vendor driver, so what
- * is left is: which of the two compile-time variants this part is (0x0004/0x0008 without FTM3_CHIP
- * or 0x0007/0x000a with it), whether the dummy byte is really there, and which of the two addresses
- * the overlay names answers. A combination that reads back 36 70 or 39 6c has settled all of it.
+ * fts_read_registers always drops one leading byte, because DUMMY_HW_REG is 1. If that is wrong for
+ * this part -- 0, or 2 -- every value read is shifted and the answer looks like a dead chip rather
+ * than a misread one. Printing all of them with the count varying is the only way to tell a wrong
+ * dummy count from a chip that really does answer 00.
+ */
+static bool
+fts_read_verbose(uint16_t address, unsigned length, unsigned dummy, const char *what)
+{
+	uint8_t buf[FTS_FIFO_DEPTH + 2];
+	unsigned total = length + dummy;
+	bool ok = false;
+
+	if (total > sizeof(buf)) {
+		return false;
+	}
+	i2c_start();
+	if (i2c_write_byte((uint8_t)(bus_address << 1)) &&
+	    i2c_write_byte(FTS_CMD_HW_REG) &&
+	    i2c_write_byte((uint8_t)(address >> 8)) &&
+	    i2c_write_byte((uint8_t)(address & 0xff))) {
+		i2c_start();
+		if (i2c_write_byte((uint8_t)(bus_address << 1 | 1))) {
+			for (unsigned i = 0; i < total; i++) {
+				buf[i] = i2c_read_byte(i + 1 < total);
+			}
+			ok = true;
+		}
+	}
+	i2c_stop();
+	if (!ok) {
+		printf("umi_touch: %s at %#06x: not acknowledged\n", what, address);
+		return false;
+	}
+	printf("umi_touch: %s at %#06x, drop %u of %u:", what, address, dummy, total);
+	for (unsigned i = 0; i < total; i++) {
+		printf(" %02x", buf[i]);
+	}
+	printf("  (sda %u scl %u)\n", gpio_get(pin_sda), gpio_get(pin_scl));
+	return true;
+}
+
+/*
+ * The eight bits of one byte, sampled twice: while the clock is high, which is when the value
+ * counts, and while it is low, which is when the slave is allowed to change it.
+ *
+ * If every high-phase sample is 0 and every low-phase sample is 1, the chip is genuinely sending
+ * 00 00 and the read path works. If both are 0, something is holding SDA down and no read on this
+ * bus can return anything but zeros -- which is the failure this driver already had once, and it
+ * looks identical from the outside.
+ */
+static void
+sample_bits(uint16_t address)
+{
+	unsigned high_phase = 0, low_phase = 0;
+	bool ok = false;
+
+	i2c_start();
+	if (i2c_write_byte((uint8_t)(bus_address << 1)) &&
+	    i2c_write_byte(FTS_CMD_HW_REG) &&
+	    i2c_write_byte((uint8_t)(address >> 8)) &&
+	    i2c_write_byte((uint8_t)(address & 0xff))) {
+		i2c_start();
+		if (i2c_write_byte((uint8_t)(bus_address << 1 | 1))) {
+			ok = true;
+		}
+	}
+	printf("umi_touch: bit samples at %#06x, %s: high ", address, ok ? "acked" : "not acked");
+	for (int bit = 7; ok && bit >= 0; bit--) {
+		i2c_delay();
+		scl_high();
+		i2c_delay();
+		if (gpio_get(pin_sda)) {
+			high_phase++;
+		}
+		printf("%u", gpio_get(pin_sda));
+		line_low(pin_scl);
+		i2c_delay();
+		if (gpio_get(pin_sda)) {
+			low_phase++;
+		}
+	}
+	printf("  low ");
+	if (ok) {
+		/* second pass: sample the same byte again, this time only while the clock is low */
+		i2c_stop();
+		i2c_start();
+		if (i2c_write_byte((uint8_t)(bus_address << 1)) &&
+		    i2c_write_byte(FTS_CMD_HW_REG) &&
+		    i2c_write_byte((uint8_t)(address >> 8)) &&
+		    i2c_write_byte((uint8_t)(address & 0xff))) {
+			i2c_start();
+			if (i2c_write_byte((uint8_t)(bus_address << 1 | 1))) {
+				for (int bit = 7; bit >= 0; bit--) {
+					printf("%u", gpio_get(pin_sda));
+					i2c_delay();
+					scl_high();
+					i2c_delay();
+					line_low(pin_scl);
+					i2c_delay();
+				}
+			}
+		}
+	}
+	i2c_stop();
+	printf("  (%u high, %u low out of 8)\n", high_phase, low_phase);
+}
+
+/*
+ * Everything the read path could still have wrong, in one boot.
+ *
+ * The command byte, the 16-bit address and one dummy byte are what the vendor driver does, and with
+ * them this part answers 00 00 at both ID addresses and 00 00 at the firmware version -- which the
+ * vendor driver itself reads as "no firmware running in the chip". Before believing that, this
+ * settles whether the reads are real: the dummy count is varied, the raw bytes are printed, the
+ * bits are sampled at both clock phases, the event FIFO is read (the interrupt line is low, so the
+ * chip believes it has something to say), and a system reset is sent to see whether a controller
+ * ready event turns up afterwards.
  */
 static void
 sweep(void)
 {
-	static const uint8_t addresses[2] = { 0x49, 0x38 };
-	static const struct {
-		uint16_t id, fw;
-		const char *name;
-	} variant[2] = {
-		{ FTS_CHIP_ID_ADDR_A, FTS_FW_VER_ADDR_A, "0x0004/0x0008" },
-		{ FTS_CHIP_ID_ADDR_B, FTS_FW_VER_ADDR_B, "0x0007/0x000a" },
-	};
+	uint8_t event[FTS_EVENT_SIZE];
+	uint8_t value;
 
-	for (unsigned a = 0; a < 2; a++) {
-		bus_address = addresses[a];
-		for (unsigned v = 0; v < 2; v++) {
-			uint8_t with_dummy[2] = { 0, 0 }, fw[2] = { 0, 0 };
+	printf("umi_touch: --- the read path, with the dummy count varied ---\n");
+	for (unsigned dummy = 0; dummy <= 2; dummy++) {
+		(void)fts_read_verbose(FTS_CHIP_ID_ADDR_A, 2, dummy, "id");
+		(void)fts_read_verbose(FTS_CHIP_ID_ADDR_B, 2, dummy, "id");
+	}
+	(void)fts_read_verbose(FTS_FW_VER_ADDR_A, 2, 1, "fw");
+	(void)fts_read_verbose(0x0000, 8, 1, "map");
 
-			(void)fts_read_registers(variant[v].id, with_dummy, 2);
-			(void)fts_read_registers(variant[v].fw, fw, 2);
-			printf("umi_touch: sweep %#04x %s: id %02x %02x fw %02x %02x%s\n",
-			    addresses[a], variant[v].name, with_dummy[0], with_dummy[1], fw[0], fw[1],
-			    (with_dummy[0] == FTS_ID_0_A && with_dummy[1] == FTS_ID_1_A) ||
-			    (with_dummy[0] == FTS_ID_0_B && with_dummy[1] == FTS_ID_1_B) ?
-			    "  <-- that is this part" : "");
+	printf("umi_touch: --- are the zero bits driven, or held down? ---\n");
+	sample_bits(FTS_CHIP_ID_ADDR_A);
+
+	printf("umi_touch: --- the event fifo, before anything ---\n");
+	for (unsigned i = 0; i < 4; i++) {
+		if (!fts_read_event(event)) {
+			printf("umi_touch: fifo read not acknowledged\n");
+			break;
+		}
+		printf("umi_touch: fifo %u: %02x %02x %02x %02x %02x %02x %02x %02x\n", i,
+		    event[0], event[1], event[2], event[3], event[4], event[5], event[6], event[7]);
+		if (event[0] == EVENTID_NO_EVENT) {
+			break;
 		}
 	}
-	bus_address = I2C_ADDRESS;
+
+	printf("umi_touch: --- a system reset over i2c, then the fifo again ---\n");
+	value = FTS_SYS_RESET_VAL_A;
+	printf("umi_touch: reset %#06x <- %02x: %s\n", FTS_SYS_RESET_ADDR_A, value,
+	    fts_write_registers(FTS_SYS_RESET_ADDR_A, &value, 1) ? "acked" : "not acked");
+	sleep_ms(100);
+	for (unsigned i = 0; i < 4; i++) {
+		if (!fts_read_event(event)) {
+			printf("umi_touch: fifo read not acknowledged\n");
+			break;
+		}
+		printf("umi_touch: after reset fifo %u: %02x %02x %02x %02x\n", i,
+		    event[0], event[1], event[2], event[3]);
+		if (event[0] == EVENTID_NO_EVENT) {
+			break;
+		}
+	}
+	value = FTS_SYS_RESET_VAL_B;
+	printf("umi_touch: reset %#06x <- %02x: %s\n", FTS_SYS_RESET_ADDR_B, value,
+	    fts_write_registers(FTS_SYS_RESET_ADDR_B, &value, 1) ? "acked" : "not acked");
+	sleep_ms(100);
+	for (unsigned i = 0; i < 4; i++) {
+		if (!fts_read_event(event)) {
+			printf("umi_touch: fifo read not acknowledged\n");
+			break;
+		}
+		printf("umi_touch: after the other reset fifo %u: %02x %02x %02x %02x\n", i,
+		    event[0], event[1], event[2], event[3]);
+		if (event[0] == EVENTID_NO_EVENT) {
+			break;
+		}
+	}
+	printf("umi_touch: at the end: sda %u scl %u int %u\n",
+	    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_INT));
 }
 
 static void
