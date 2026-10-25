@@ -3387,8 +3387,19 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 */
 	if (quietarg) {
 		quiet_probe();
-		thread_terminate(current_thread());
-		return;
+		/*
+		 * With fullscan on the same command line, quiet is the first phase of one run instead of
+		 * a run of its own. A boot costs a 2.4 GB upload, so the two readings that have to happen
+		 * at different times -- the untouched state, which only exists before power_up(), and the
+		 * full scan, which is only meaningful after it -- belong in one boot:
+		 *
+		 *     umi_touch=1 umi_touch_quiet=1 umi_touch_fullscan=1
+		 */
+		if (!fullarg) {
+			thread_terminate(current_thread());
+			return;
+		}
+		printf("umi_touch: quiet was the first phase; continuing into the powered run\n");
 	}
 	/*
 	 * umi_touch_supply=1: put the board back the way Android leaves it, in the order the hardware
