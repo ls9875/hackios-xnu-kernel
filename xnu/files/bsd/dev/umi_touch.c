@@ -1103,6 +1103,8 @@ sample_bits(uint16_t address)
 	printf("  (%u high, %u low out of 8)\n", high_phase, low_phase);
 }
 
+static bool panel_supply_on(const char *name);   /* pm8150_s4 / smpa4, defined with the RPMh code below */
+
 /*
  * Everything the read path could still have wrong, in one boot.
  *
@@ -1130,6 +1132,61 @@ sweep(void)
 
 	printf("umi_touch: --- are the zero bits driven, or held down? ---\n");
 	sample_bits(FTS_CHIP_ID_ADDR_A);
+
+	/*
+	 * The one thing none of the above tests: whether the chip is powered at all.
+	 *
+	 * The overlay's fts@49 has avdd-supply = <&pm8150_s4> and fts,pwr-reg-name = "avdd", and
+	 * vdd-supply is PHANDLE_NONE -- so the rail this part runs from is the main PMIC's SMPS4,
+	 * which RPMh knows as "smpa4", and there is no second rail to worry about. Nothing in this
+	 * port had ever asked RPMh for it. What it had asked for is ldoc1, on the strength of
+	 * fts,bus-reg-name = "vdd"; that name points at a supply that does not exist.
+	 *
+	 * A part whose I/O ring is fed from an always-on 1.8 V and whose core is not answers its
+	 * address, holds every data bit at zero and looks exactly like a part with no firmware. So
+	 * this raises the rail, gives the chip a power-on reset it has never had, and reads the id
+	 * again -- the before and after are two lines apart in the same log.
+	 */
+	printf("umi_touch: --- avdd: pm8150_s4 (smpa4), then the id again ---\n");
+	{
+		static const char *const rails[] = { "smpa4", "smpa5" };
+		bool answered = false;
+
+		for (unsigned r = 0; r < 2 && !answered; r++) {
+			uint8_t id[2] = { 0, 0 };
+
+			if (!panel_supply_on(rails[r])) {
+				continue;
+			}
+			sleep_ms(5);
+			gpio_output(PIN_RESET, false, PULL_NONE, 2);    /* in reset while the rail settles */
+			sleep_ms(20);
+			gpio_output(PIN_RESET, true, PULL_NONE, 2);
+			sleep_ms(settle_ms);
+			printf("umi_touch: after %s and a reset pulse: sda %u scl %u reset %u int %u\n",
+			    rails[r], gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_RESET),
+			    gpio_get(PIN_INT));
+			(void)fts_read_verbose(FTS_CHIP_ID_ADDR_A, 2, 1, "id after avdd");
+			(void)fts_read_verbose(FTS_CHIP_ID_ADDR_B, 2, 1, "id after avdd");
+			(void)fts_read_verbose(FTS_CHIP_ID_ADDR_A, 2, 0, "id after avdd, no dummy");
+			/*
+			 * The same two bytes through the normal path, so that "is the chip there" is a
+			 * value this code can decide on rather than a line a person has to read.
+			 */
+			if (fts_read_registers(FTS_CHIP_ID_ADDR_A, id, 2)) {
+				answered = id[0] != 0 || id[1] != 0;
+				printf("umi_touch: %s: id %02x %02x -> %s\n", rails[r], id[0], id[1],
+				    answered ? "a chip that answers" : "still all zero");
+			}
+			if (answered) {
+				sample_bits(FTS_CHIP_ID_ADDR_A);
+			}
+		}
+		if (!answered) {
+			printf("umi_touch: avdd did not change the answer; the readings above are from a part "
+			    "that either has no firmware or is not the thing at %#x\n", I2C_ADDRESS);
+		}
+	}
 
 	printf("umi_touch: --- the event fifo, before anything ---\n");
 	for (unsigned i = 0; i < 4; i++) {
@@ -1405,7 +1462,12 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	return done;
 }
 
-/* pm8150a_l1, the pair's bus supply: 1.8 V, fixed, and per the overlays nothing else uses it. */
+/*
+ * pm8150a_l1: what fts,bus-reg-name = "vdd" was taken to mean. It is 1.8 V and fixed, and it is
+ * still worth asking for -- but the overlay's vdd-supply is PHANDLE_NONE, so this is a guess at
+ * the pair's pull-up rail and not a reading of the tree. The rail that is written down is avdd,
+ * which panel_supply_on() below raises.
+ */
 static bool
 bus_supply_on(void)
 {
@@ -1426,6 +1488,41 @@ bus_supply_on(void)
 	printf("umi_touch: RPMh: ldoc1 at %#x, 1800 mV: slot status %#x, control %#x\n", base,
 	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)));
 	return rpmh_write(address, data, 3);
+}
+
+/*
+ * pm8150_s4: the rail this part actually runs from.
+ *
+ * fts@49 in the panel overlay names avdd-supply = <&pm8150_s4> and fts,pwr-reg-name = "avdd";
+ * vdd-supply, which fts,bus-reg-name = "vdd" points at, is PHANDLE_NONE -- there is no such
+ * supply on this board. The node is rpmh-regulator-smpa4/regulator-pm8150-s4, so the name RPMh
+ * knows it by is "smpa4", 0x40000 in the command database, and its qcom,init-voltage is
+ * 1 800 000 uV with min and max pinned to the same value.
+ *
+ * It is an SMPS and not an LDO, so only the voltage and the enable are written: the mode field
+ * means something different for each regulator type and the node does not ask for one.
+ */
+static bool
+panel_supply_on(const char *name)
+{
+	uint32_t base = rpmh_address(name);
+	uint32_t address[2];
+	uint32_t data[2];
+
+	if (!rsc) {
+		rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	}
+	if (base == 0) {
+		printf("umi_touch: RPMh has no regulator \"%s\" (address %#x)\n", name, base);
+		return false;
+	}
+	address[0] = base + VRM_VOLTAGE;
+	address[1] = base + VRM_ENABLE;
+	data[0] = 1800;                 /* 1 800 000 uV */
+	data[1] = 1;                    /* on */
+	printf("umi_touch: RPMh: %s at %#x, 1800 mV (avdd): slot status %#x, control %#x\n", name, base,
+	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)));
+	return rpmh_write(address, data, 2);
 }
 
 static void
@@ -1484,8 +1581,10 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 
 	show_pins("as found");
 	/*
-	 * umi_touch_supply=1: ask RPMh for pm8150a_l1 before anything else, because without that rail
-	 * there is no high level on the pair and no device to talk to.
+	 * umi_touch_supply=1: ask RPMh for both rails before anything else. ldoc1 is the 1.8 V the
+	 * pair's pull-ups are said to hang from; smpa4 is pm8150_s4, the part's own avdd. Asking for
+	 * only the first was asking for the one that does not exist, and it is why every read on
+	 * this bus came back 00 00 with an acknowledge.
 	 */
 	if (sup) {
 		rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
@@ -1493,6 +1592,14 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		    bus_supply_on() ? "done" : "refused or timed out");
 		sleep_ms(20);
 		show_pins("with the bus supply asked for");
+		printf("umi_touch: asking RPMh for avdd: %s\n",
+		    panel_supply_on("smpa4") ? "done" : "refused or timed out");
+		sleep_ms(5);
+		gpio_output(PIN_RESET, false, PULL_NONE, 2);
+		sleep_ms(20);
+		gpio_output(PIN_RESET, true, PULL_NONE, 2);
+		sleep_ms(settle_ms);
+		show_pins("with avdd asked for and the chip out of reset");
 	}
 	/*
 	 * umi_touch_scan=1: who is on this bus at all, with the reset held one way and then the
