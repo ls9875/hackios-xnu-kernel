@@ -915,14 +915,21 @@ sweep(void)
 {
 	static const uint8_t addresses[2] = { 0x49, 0x38 };
 
+	/*
+	 * Every combination has to fit in about a second: this kernel reaches bsd_init and panics on
+	 * the missing launchd roughly 1.4 s after the driver starts, and a 256-register dump per
+	 * combination spends that budget on two of sixteen. So a combination costs seven transfers --
+	 * boot ID, both ID bytes, four registers that were non-zero, and a write-and-read-back -- and
+	 * only a combination that looks interesting pays for the whole map.
+	 */
 	for (unsigned a = 0; a < 2; a++) {
 		for (unsigned r16 = 0; r16 < 2; r16++) {
 			for (unsigned nr = 0; nr < 2; nr++) {
 				for (unsigned st = 0; st < 2; st++) {
 					uint8_t idh = 0, idl = 0, boot[2] = { 0, 0 };
 					uint8_t probe_old = 0, probe_now = 0, five_a = 0x5a;
-					unsigned non_zero = 0;
-					bool stuck;
+					uint8_t r86 = 0, ra6 = 0, ra8 = 0, rfa = 0;
+					bool stuck, interesting;
 
 					bus_address = addresses[a];
 					reg16 = r16 != 0;
@@ -936,22 +943,25 @@ sweep(void)
 					(void)i2c_read_registers(FTS_CMD_BOOT_ID, boot, 2);
 					(void)i2c_read_registers(FTS_REG_CHIP_ID_HIGH, &idh, 1);
 					(void)i2c_read_registers(FTS_REG_CHIP_ID_LOW, &idl, 1);
-					for (unsigned reg = 0; reg < 256; reg++) {
-						uint8_t v = 0xff;
-
-						if (i2c_read_registers((uint8_t)reg, &v, 1) && v != 0x00) {
-							non_zero++;
-						}
-					}
+					(void)i2c_read_registers(0x86, &r86, 1);
+					(void)i2c_read_registers(0xa6, &ra6, 1);
+					(void)i2c_read_registers(0xa8, &ra8, 1);
+					(void)i2c_read_registers(0xfa, &rfa, 1);
 					(void)i2c_read_registers(0x50, &probe_old, 1);
 					(void)i2c_write_registers(0x50, &five_a, 1);
 					(void)i2c_read_registers(0x50, &probe_now, 1);
 					(void)i2c_write_registers(0x50, &probe_old, 1);
 					stuck = probe_now == five_a;
-					printf("umi_touch: sweep addr %#04x reg16 %u norepeat %u start %u:"
-					    " boot %02x %02x id %02x %02x, %u non-zero, write %s\n",
-					    addresses[a], r16, nr, st, boot[0], boot[1], idh, idl, non_zero,
-					    stuck ? "STUCK" : "ignored");
+					printf("umi_touch: sweep %#04x r16=%u nr=%u st=%u: boot %02x %02x id %02x %02x"
+					    " 86=%02x a6=%02x a8=%02x fa=%02x write %s\n",
+					    addresses[a], r16, nr, st, boot[0], boot[1], idh, idl,
+					    r86, ra6, ra8, rfa, stuck ? "STUCK" : "ignored");
+					interesting = stuck || idh != 0x00 || idl != 0x00 ||
+					    (boot[0] != 0x00 && boot[0] != 0xff);
+					if (interesting) {
+						printf("umi_touch: that one is worth the map://n");
+						register_dump();
+					}
 				}
 			}
 		}
