@@ -2456,6 +2456,18 @@ power_up(void)
 	printf("umi_touch: power: smpa4 back on (an earlier run turned it off): %s\n",
 	    panel_supply_on("smpa4") ? "done" : "refused");
 	sleep_ms(10);
+	/*
+	 * The other avdd-supply variant from the overlay: fts@49 names pm8150_s4 (smpa4) in one
+	 * fragment and pm8150_s5 (smpa5) in another as its core supply. power_up() voted smpa4 from
+	 * the start but never smpa5, so a unit whose core hangs off smpa5 has been running with its
+	 * I/O ring powered (ldoc1 / gpio69) -- which is why it acknowledges every address -- and its
+	 * core dark: every register read returns 0x00, the interrupt line still toggles on reset
+	 * because the I/O ring is alive, and no clock rate, framing or power cycle on this side moves
+	 * it. Voting smpa5 is a no-op if Android already left it on; if it is off, this is the rail.
+	 */
+	printf("umi_touch: power: smpa5 (pm8150_s5, the other avdd-supply variant): %s\n",
+	    panel_supply_on("smpa5") ? "done" : "refused");
+	sleep_ms(10);
 	printf("umi_touch: power: ldoc1 (pm8150a_l1, 1.8 V): %s\n",
 	    bus_supply_on() ? "done" : "refused");
 	sleep_ms(20);
