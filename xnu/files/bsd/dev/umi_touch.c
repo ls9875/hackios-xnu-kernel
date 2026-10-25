@@ -50,6 +50,7 @@
  *                       for a board whose pull-ups are not powered in this boot environment
  *   umi_touch_cmd_db=1  print what RPMh can switch, with the address of each, and stop
  *   umi_touch_scan=1    ask every address on the bus who is there, before anything else, and stop
+ *   umi_touch_supply=1  ask RPMh for pm8150a_l1 (ldoc1, 1.8 V) before touching the bus
  *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
  *                       low, 2 does not touch it -- one of the three is the chip out of reset
  *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
@@ -842,11 +843,156 @@ dump_cmd_db(void)
 	}
 }
 
+/*
+ * ---- asking RPMh for the bus supply ---------------------------------------------------------------
+ *
+ * The same code as bsd/dev/redwood_goodix.c's io_supply_on(), which does this on the POCO X5 Pro for
+ * its own touch controller, and it is here rather than shared because the two drivers' register maps
+ * otherwise have nothing in common and a header would be one function in a file of its own.
+ *
+ * The rail is pm8150a_l1: the panel overlay names it as fts@49's vdd-supply, and fts,bus-reg-name is
+ * "vdd" -- the bus supply, the one the pair's pull-ups hang from. Without it there is no high level
+ * on SDA or SCL at all, which is what this driver measured before it could talk to anything. Its
+ * device-tree node is rpmh-regulator-ldoc1/regulator-pm8150a-l1, so the name RPMh knows it by is
+ * "ldoc1" -- 0x42e00 in the command database -- at 1 800 000 uV, fixed, and nothing else in the tree
+ * refers to it.
+ */
+#define RSC_PHYS                 0x18220000UL   /* the application processor's "DRV 2" */
+#define RSC_SIZE                 0x10000UL
+#define TCS(reg)                 (rsc + 0xd00 + (reg))      /* command slot set 0, an "active" one */
+#define TCS_IRQ_ENABLE           0x00
+#define TCS_IRQ_STATUS           0x04
+#define TCS_IRQ_CLEAR            0x08
+#define TCS_WAIT_FOR_COMPLETION  0x10
+#define TCS_CONTROL              0x14
+#define TCS_CONTROL_ENABLE       (1u << 16)
+#define TCS_CONTROL_TRIGGER      (1u << 24)
+#define TCS_STATUS               0x18            /* 0 while busy */
+#define TCS_CMD_ENABLE           0x1c
+#define TCS_CMD_MSGID(n)         (0x30 + 20 * (n))
+#define TCS_CMD_ADDR(n)          (0x34 + 20 * (n))
+#define TCS_CMD_DATA(n)          (0x38 + 20 * (n))
+#define MSGID_WRITE_4_BYTES      0x10008
+#define MSGID_RESPONSE           0x100
+
+#define VRM_VOLTAGE              0               /* a regulator's registers, from its address: millivolts */
+#define VRM_ENABLE               4
+#define VRM_MODE                 8
+#define VRM_MODE_LDO_HPM         7
+
+static vm_offset_t rsc;
+
+/* The RPMh address of a resource by the name the boot loader's command database gave it; 0 = none. */
+static uint32_t
+rpmh_address(const char *name)
+{
+	const struct cmd_db_header *db;
+
+	db = (const struct cmd_db_header *)ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);
+	if (db->magic[0] != 0xdb || db->magic[1] != 0x30 || db->magic[2] != 0x03 || db->magic[3] != 0x0c) {
+		return 0;
+	}
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &db->slave[s];
+		const struct cmd_db_entry *entry;
+
+		if (slave->id == 0 || slave->header_offset >= CMD_DB_SIZE - 0x1000 || slave->count > 512) {
+			continue;
+		}
+		entry = (const struct cmd_db_entry *)(db->data + slave->header_offset);
+		for (unsigned i = 0; i < slave->count; i++) {
+			char id[8] = { 0 };
+
+			strlcpy(id, name, sizeof(id));
+			if (memcmp(entry[i].id, id, sizeof(id)) == 0) {
+				return entry[i].address;
+			}
+		}
+	}
+	return 0;
+}
+
+static bool
+rpmh_wait(uint32_t reg, uint32_t mask, uint32_t value, const char *what)
+{
+	for (int i = 0; i < 2000; i++) {
+		if ((rd(TCS(reg)) & mask) == value) {
+			return true;
+		}
+		sleep_us(100);
+	}
+	printf("umi_touch: RPMh: timeout waiting for %s (register %#x = %#x)\n", what, reg, rd(TCS(reg)));
+	return false;
+}
+
+/* Send up to three register writes to RPMh and wait until they are done. */
+static bool
+rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
+{
+	uint32_t irq_enable = rd(TCS(TCS_IRQ_ENABLE));
+	bool done;
+
+	/* the slot set must be idle, and switched off the way the hardware wants it: trigger, then enable */
+	for (int i = 0; rd(TCS(TCS_STATUS)) == 0; i++) {
+		if (i > 2000) {
+			printf("umi_touch: RPMh: the command slots stay busy\n");
+			return false;
+		}
+		sleep_us(100);
+	}
+	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_TRIGGER);
+	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_ENABLE);
+	wr(TCS(TCS_IRQ_CLEAR), 1);
+	for (unsigned i = 0; i < count; i++) {
+		wr(TCS(TCS_CMD_MSGID(i)), MSGID_WRITE_4_BYTES | MSGID_RESPONSE);
+		wr(TCS(TCS_CMD_ADDR(i)), address[i]);
+		wr(TCS(TCS_CMD_DATA(i)), data[i]);
+	}
+	wr(TCS(TCS_WAIT_FOR_COMPLETION), (1u << count) - 1);
+	wr(TCS(TCS_CMD_ENABLE), (1u << count) - 1);
+	wr(TCS(TCS_IRQ_ENABLE), irq_enable | 1);        /* the status bit follows the enable; the interrupt itself stays masked */
+	wr(TCS(TCS_CONTROL), TCS_CONTROL_ENABLE);
+	wr(TCS(TCS_CONTROL), TCS_CONTROL_ENABLE | TCS_CONTROL_TRIGGER);
+
+	done = rpmh_wait(TCS_IRQ_STATUS, 1, 1, "the request");
+	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_TRIGGER);
+	wr(TCS(TCS_CONTROL), rd(TCS(TCS_CONTROL)) & ~TCS_CONTROL_ENABLE);
+	wr(TCS(TCS_CMD_ENABLE), 0);
+	wr(TCS(TCS_WAIT_FOR_COMPLETION), 0);
+	wr(TCS(TCS_IRQ_CLEAR), 1);
+	wr(TCS(TCS_IRQ_ENABLE), irq_enable);
+	return done;
+}
+
+/* pm8150a_l1, the pair's bus supply: 1.8 V, fixed, and per the overlays nothing else uses it. */
+static bool
+bus_supply_on(void)
+{
+	uint32_t base = rpmh_address("ldoc1");
+	uint32_t address[3];
+	uint32_t data[3];
+
+	if (base == 0 || (base >> 16 & 0xf) != 4) {
+		printf("umi_touch: RPMh has no regulator \"ldoc1\" (address %#x)\n", base);
+		return false;
+	}
+	address[0] = base + VRM_VOLTAGE;
+	address[1] = base + VRM_ENABLE;
+	address[2] = base + VRM_MODE;
+	data[0] = 1800;                 /* the node's qcom,init-voltage: 1 800 000 uV */
+	data[1] = 1;                    /* on */
+	data[2] = VRM_MODE_LDO_HPM;
+	printf("umi_touch: RPMh: ldoc1 at %#x, 1800 mV: slot status %#x, control %#x\n", base,
+	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)));
+	return rpmh_write(address, data, 3);
+}
+
 static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, reg = 0, one = 0, pp = 0, cd = 0;
 	uint32_t sc = 0;
+	uint32_t sup = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -866,6 +1012,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		bit_us = 3;
 	}
 	PE_parse_boot_argn("umi_touch_scan", &sc, sizeof(sc));
+	PE_parse_boot_argn("umi_touch_supply", &sup, sizeof(sup));
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
@@ -892,6 +1039,17 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 
 	show_pins("as found");
+	/*
+	 * umi_touch_supply=1: ask RPMh for pm8150a_l1 before anything else, because without that rail
+	 * there is no high level on the pair and no device to talk to.
+	 */
+	if (sup) {
+		rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+		printf("umi_touch: asking RPMh for the bus supply: %s\n",
+		    bus_supply_on() ? "done" : "refused or timed out");
+		sleep_ms(20);
+		show_pins("with the bus supply asked for");
+	}
 	/*
 	 * umi_touch_scan=1: who is on this bus at all, with the reset held one way and then the
 	 * other. It runs before anything is decided about the chip, because "no acknowledge at
