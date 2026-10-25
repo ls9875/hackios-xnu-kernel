@@ -176,16 +176,36 @@ wr(vm_offset_t address, uint32_t value)
 	*(volatile uint32_t *)address = value;
 }
 
+/*
+ * Every wait in here spins. delay_for_interval() sleeps for anything but the shortest intervals,
+ * and on this boot path a thread that sleeps does not come back: the run that first got as far
+ * as the reset stopped dead at the 5 ms wait after driving gpio69, and the one before it stopped
+ * inside the bus-recovery clock pulses. A bit-banged clock wants the line held for three
+ * microseconds, not for a scheduler timeslice -- which would break I2C even if it returned --
+ * and a reset sequence wants 200 ms of wall time whatever else is runnable. So wait on the
+ * timebase, which redwood_adreno.c and redwood_apfs_check.c already do on this port.
+ */
+static void
+sleep_ns(uint64_t ns)
+{
+	uint64_t deadline;
+
+	clock_interval_to_deadline((uint32_t)ns, 1, &deadline);
+	while (mach_absolute_time() < deadline) {
+		/* spin */
+	}
+}
+
 static void
 sleep_us(uint32_t us)
 {
-	delay_for_interval(us, NSEC_PER_USEC);
+	sleep_ns((uint64_t)us * NSEC_PER_USEC);
 }
 
 static void
 sleep_ms(uint32_t ms)
 {
-	delay_for_interval(ms, NSEC_PER_MSEC);
+	sleep_ns((uint64_t)ms * NSEC_PER_MSEC);
 }
 
 static void
