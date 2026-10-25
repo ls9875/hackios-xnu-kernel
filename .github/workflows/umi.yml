@@ -91,8 +91,11 @@ jobs:
       - name: Toolchain
         run: |
           sudo apt-get update -qq
+          # uuid-dev: xnu-deps/hostinc/hostcompat.h includes <uuid/uuid.h>, and the host tools
+          # (setsegname, kextsymboltool, decomment, config) are built from it in exporthdrs,
+          # the first step that compiles anything.
           sudo apt-get install -y -qq clang lld llvm flex bison m4 perl python3 autoconf automake \
-            libtool curl xz-utils git build-essential libxml2 libtinfo6
+            libtool curl xz-utils git build-essential libxml2 libtinfo6 uuid-dev
           clang --version | head -1
 
       # theos: the cctools Mach-O linker the kernel is linked with. Its Linux toolchain is a
