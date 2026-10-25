@@ -475,7 +475,20 @@ i2c_read_byte(bool ack)
 	return value;
 }
 
-/* A transfer left half finished can hold SDA down; nine clocks let the chip let go of it. */
+/*
+ * A transfer left half finished holds a line down; nine clocks let the chip let go of it.
+ *
+ * Both lines are checked, not just SDA. A slave that is waiting for the rest of a byte stretches
+ * the *clock*, and holding SCL down is the whole point of that: SDA can be high at the same time
+ * and this function used to read that as "the bus is idle" and return without doing anything.
+ * The state then survives, because `fastboot boot` does not power-cycle the SoC, so the next run
+ * starts with the chip still mid-byte and every read it makes returns zeros with an acknowledge
+ * on every byte -- which is indistinguishable from a chip that is answering zeros.
+ *
+ * That is not hypothetical: run 214959 opened with `sda 0x3/0 scl 0x3/0`, both lines low with the
+ * pull-ups on, and one two-byte register read took 267 ms instead of 0.7 ms, because scl_high()
+ * was timing out on every single clock. The runs before it had left the chip there.
+ */
 static void
 i2c_bus_recover(void)
 {
@@ -484,19 +497,19 @@ i2c_bus_recover(void)
 	line_release(pin_sda);
 	line_release(pin_scl);
 	i2c_delay();
-	if (gpio_get(pin_sda)) {
-		return;                     /* the bus is idle */
+	if (gpio_get(pin_sda) && gpio_get(pin_scl)) {
+		return;                     /* both lines high: the bus is idle */
 	}
-	printf("umi_touch: the bus is stuck with SDA low; clocking it free\n");
-	for (pulses = 0; pulses < 9 && !gpio_get(pin_sda); pulses++) {
-		printf("umi_touch: ... pulse %d: sda %u scl %#x\n", pulses,
-		    gpio_get(pin_sda), rd(GPIO_CFG(pin_scl)));
+	printf("umi_touch: the bus is stuck (sda %u scl %u); clocking it free\n",
+	    gpio_get(pin_sda), gpio_get(pin_scl));
+	for (pulses = 0; pulses < 9 && !(gpio_get(pin_sda) && gpio_get(pin_scl)); pulses++) {
 		line_low(pin_scl);
 		i2c_delay();
 		line_release(pin_scl);
 		i2c_delay();
 	}
-	printf("umi_touch: ... %d pulse(s), sda now %u\n", pulses, gpio_get(pin_sda));
+	printf("umi_touch: ... %d pulse(s), sda %u scl %u\n", pulses,
+	    gpio_get(pin_sda), gpio_get(pin_scl));
 	line_low(pin_sda);
 	i2c_delay();
 	line_release(pin_scl);
@@ -1128,6 +1141,15 @@ sweep(void)
 	uint8_t event[FTS_EVENT_SIZE];
 	uint8_t value;
 
+	/*
+	 * Before anything is measured: clear whatever the previous run left on this pair. A run that
+	 * ended in the middle of a byte leaves the chip stretching the clock, and every reading after
+	 * that is zeros for a reason that has nothing to do with the chip.
+	 */
+	i2c_bus_recover();
+	printf("umi_touch: the pair before anything: sda %u scl %u\n",
+	    gpio_get(pin_sda), gpio_get(pin_scl));
+
 	printf("umi_touch: --- the read path, with the dummy count varied ---\n");
 	for (unsigned dummy = 0; dummy <= 2; dummy++) {
 		(void)fts_read_verbose(FTS_CHIP_ID_ADDR_A, 2, dummy, "id");
@@ -1713,9 +1735,11 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		uint8_t id[2] = { 0, 0 };
 
 		pins_for_i2c();
+		i2c_bus_recover();              /* the previous run may have left it mid-byte */
 		/*
-		 * The order matters and it is the point of this whole step. The I2C lines are driven low
-		 * *first*, while the rail is still up, and they stay low while it goes down. Driving them
+		 * The order matters and it is the point of this whole step.
+		 * The I2C lines are driven low first, while the rail is still up, and they stay low
+		 * while it goes down. Driving them
 		 * high into an unpowered part is what this driver has been doing for every run of this
 		 * session -- the lines go into the chip's esd diodes and back-power it through them, into
 		 * a state no reset can reach, because reset only resets the digital core and the state
