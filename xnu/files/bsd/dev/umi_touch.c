@@ -764,7 +764,321 @@ fts_read_raw(uint8_t op, uint16_t address, uint8_t *data, uint32_t length)
 	return ok;
 }
 
-/* ftsIO.c:writeCmdU16 -- the command, both address bytes and the data in one transaction. */
+/* ---- the flash loader -------------------------------------------------------------------------- */
+
+#include "umi_fts_fw.h"
+
+/*
+ * The register file at 0xB6 reads zero at every address in the space, and the part still answers
+ * its address, still pulls INT down nine milliseconds after reset, and still holds SDA low for
+ * every bit of every byte it is asked for. That is not a dead chip and it is not a chip without a
+ * supply. It is a chip whose *application* is not what is answering.
+ *
+ * What answers instead is the flash loader, and ftsFlash.c says what that wants: a command byte
+ * instead of an address, and a different set of them -- 0xF7 unlock, 0xF8 write, 0xF9 read
+ * register, 0xFA write register -- rather than the application's 0xB6. The interrupt turning up
+ * nine milliseconds after reset is the loader saying it is up, not an application: an application
+ * that could answer 0xB6 would have answered it.
+ *
+ * The device tree names the firmware this panel wants: fts,default-fw-name = "st_fts_j2.ftb". The
+ * vendor driver loads it from /vendor/firmware on every probe; nothing loads it here, which is the
+ * whole of the difference between this and the Android that drives the same part on the same bus.
+ */
+#define FLASH_CMD_UNLOCK          0xF7
+#define FLASH_CMD_WRITE_64K       0xF8
+#define FLASH_CMD_READ_REGISTER   0xF9
+#define FLASH_CMD_WRITE_REGISTER  0xFA
+#define FLASH_UNLOCK_CODE0        0x74
+#define FLASH_UNLOCK_CODE1        0x45
+#define FLASH_ERASE_UNLOCK_CODE0  0x72
+#define FLASH_ERASE_UNLOCK_CODE1  0x03
+#define FLASH_ERASE_CODE0         0x02
+#define FLASH_ERASE_CODE1         0xC0
+#define FLASH_DMA_CODE0           0x05
+#define FLASH_DMA_CODE1           0xC0
+#define FLASH_DMA_CONFIG          0x06
+#define FLASH_CHUNK               1024     /* bytes handed to one DMA burst */
+#define DMA_CHUNK                 32       /* bytes in one 0xF8 write */
+#define FLASH_RETRY               200
+#define FLASH_RETRY_MS            10
+#define FLASH_ADDR_CONFIG_WORDS   0x0000FC00   /* the loader addresses flash in 32-bit words */
+#define ADDR_WARM_BOOT            0x001E
+#define WARM_BOOT_VALUE           0x38
+#define FW_PAYLOAD_OFFSET         68       /* 64 of header, then the four-byte header crc */
+
+/* START, the address, the bytes, STOP -- ftsIO.c:fts_writeCmd with a buffer of any length. */
+static bool
+fts_write_bytes(const uint8_t *bytes, uint32_t length)
+{
+	bool ok;
+
+	i2c_start();
+	ok = i2c_write_byte((uint8_t)(bus_address << 1));
+	for (uint32_t i = 0; ok && i < length; i++) {
+		ok = i2c_write_byte(bytes[i]);
+	}
+	i2c_stop();
+	return ok;
+}
+
+/* START, the command, repeated START, the answer, STOP -- ftsIO.c:fts_readCmd. No dummy byte. */
+static bool
+fts_write_then_read(const uint8_t *cmd, uint32_t cmd_length, uint8_t *buf, uint32_t length)
+{
+	bool ok;
+
+	i2c_start();
+	ok = i2c_write_byte((uint8_t)(bus_address << 1));
+	for (uint32_t i = 0; ok && i < cmd_length; i++) {
+		ok = i2c_write_byte(cmd[i]);
+	}
+	if (ok) {
+		i2c_start();
+		ok = i2c_write_byte((uint8_t)(bus_address << 1 | 1));
+		for (uint32_t i = 0; ok && i < length; i++) {
+			buf[i] = i2c_read_byte(i + 1 < length);
+		}
+	}
+	i2c_stop();
+	return ok;
+}
+
+/* ftsFlash.c:wait_for_flash_ready -- 0xF9 <type>, one byte, ready when bit 7 is clear. */
+static bool
+flash_wait_ready(uint8_t type)
+{
+	uint8_t cmd[2] = { FLASH_CMD_READ_REGISTER, type };
+	uint8_t status = 0;
+
+	for (unsigned i = 0; i < FLASH_RETRY; i++) {
+		if (fts_write_then_read(cmd, sizeof(cmd), &status, 1) && (status & 0x80) == 0) {
+			return true;
+		}
+		sleep_ms(FLASH_RETRY_MS);
+	}
+	printf("umi_touch: flash: %#04x never became ready, last status %02x\n", type, status);
+	return false;
+}
+
+/*
+ * umi_touch_flash=1: ask the loader who it is, and nothing else. Four status registers, the id
+ * before and after a warm boot, and the id after an unlock. Every one of these is a read or a
+ * single harmless command, so this run cannot leave the part in a worse state than it found it.
+ */
+static void
+flash_diagnostic(void)
+{
+	static const uint8_t registers[] = { 0x00, 0x01, 0x02, 0x05 };
+	uint8_t cmd[2];
+	uint8_t value = 0;
+	uint8_t id[2];
+	bool ok;
+	uint8_t warm[4] = { FTS_CMD_HW_REG, (uint8_t)(ADDR_WARM_BOOT >> 8),
+		            (uint8_t)(ADDR_WARM_BOOT & 0xff), WARM_BOOT_VALUE };
+	uint8_t unlock[3] = { FLASH_CMD_UNLOCK, FLASH_UNLOCK_CODE0, FLASH_UNLOCK_CODE1 };
+
+	printf("umi_touch: --- the flash loader: is it what has been answering? ---\n");
+	for (unsigned i = 0; i < sizeof(registers); i++) {
+		cmd[0] = FLASH_CMD_READ_REGISTER;
+		cmd[1] = registers[i];
+		value = 0;
+		if (fts_write_then_read(cmd, sizeof(cmd), &value, 1)) {
+			printf("umi_touch: loader 0xF9 %02x reads %02x%s\n", registers[i], value,
+			    value ? "   <- the loader is there" : "");
+		} else {
+			printf("umi_touch: loader 0xF9 %02x reads nothing\n", registers[i]);
+		}
+	}
+
+	id[0] = id[1] = 0;
+	ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+	printf("umi_touch: id before the warm boot: %s %02x %02x\n", ok ? "read" : "fail",
+	    id[0], id[1]);
+
+	if (fts_write_bytes(warm, sizeof(warm))) {
+		sleep_ms(100);
+		id[0] = id[1] = 0;
+		ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+		printf("umi_touch: id after the warm boot:  %s %02x %02x\n", ok ? "read" : "fail",
+		    id[0], id[1]);
+	} else {
+		printf("umi_touch: the warm boot command was not acknowledged\n");
+	}
+
+	if (fts_write_bytes(unlock, sizeof(unlock))) {
+		sleep_ms(50);
+		cmd[0] = FLASH_CMD_READ_REGISTER;
+		cmd[1] = 0x00;
+		value = 0;
+		if (fts_write_then_read(cmd, sizeof(cmd), &value, 1)) {
+			printf("umi_touch: loader 0xF9 00 after the unlock reads %02x\n", value);
+		}
+		id[0] = id[1] = 0;
+		ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+		printf("umi_touch: id after the unlock:     %s %02x %02x\n", ok ? "read" : "fail",
+		    id[0], id[1]);
+	} else {
+		printf("umi_touch: the unlock command was not acknowledged\n");
+	}
+}
+
+/*
+ * ftsFlash.c:fillFlash -- the bytes go in 32 at a time as 0xF8 <offset16> <data>, and then one
+ * DMA command tells the loader to commit the whole 1 KB burst to flash at a word address.
+ */
+static bool
+flash_fill(uint32_t address_words, const uint8_t *data, uint32_t size)
+{
+	uint8_t buffer[3 + DMA_CHUNK];
+	uint32_t remaining = size;
+	uint32_t wheel = 0;
+
+	while (remaining > 0) {
+		uint32_t in_block = 0;
+		uint32_t offset = 0;
+		uint8_t config[9];
+		uint8_t dma[3] = { FLASH_CMD_WRITE_REGISTER, FLASH_DMA_CODE0, FLASH_DMA_CODE1 };
+		uint32_t words;
+		uint32_t address;
+
+		while (in_block < FLASH_CHUNK && remaining > 0) {
+			uint32_t to_write = FLASH_CHUNK - in_block;
+
+			if (to_write > DMA_CHUNK) {
+				to_write = DMA_CHUNK;
+			}
+			if (to_write > remaining) {
+				to_write = remaining;
+			}
+			buffer[0] = FLASH_CMD_WRITE_64K;
+			buffer[1] = (uint8_t)((offset & 0xff00) >> 8);
+			buffer[2] = (uint8_t)(offset & 0xff);
+			memcpy(&buffer[3], data, to_write);
+			if (!fts_write_bytes(buffer, 3 + to_write)) {
+				printf("umi_touch: flash: the write at %u was not acknowledged\n", offset);
+				return false;
+			}
+			offset += to_write;
+			in_block += to_write;
+			data += to_write;
+			remaining -= to_write;
+		}
+
+		words = in_block / 4 - 1;
+		address = address_words + (wheel * FLASH_CHUNK) / 4;
+		config[0] = FLASH_CMD_WRITE_REGISTER;
+		config[1] = FLASH_DMA_CONFIG;
+		config[2] = 0x00;
+		config[3] = 0x00;
+		config[4] = (uint8_t)(address & 0xff);
+		config[5] = (uint8_t)((address >> 8) & 0xff);
+		config[6] = (uint8_t)(words & 0xff);
+		config[7] = (uint8_t)((words >> 8) & 0xff);
+		config[8] = 0x00;
+		if (!fts_write_bytes(config, sizeof(config))) {
+			printf("umi_touch: flash: the dma config at %u was not acknowledged\n", wheel);
+			return false;
+		}
+		if (!fts_write_bytes(dma, sizeof(dma)) || !flash_wait_ready(FLASH_DMA_CODE0)) {
+			printf("umi_touch: flash: the dma burst at %u did not complete\n", wheel);
+			return false;
+		}
+		if ((wheel & 7) == 7) {
+			printf("umi_touch: flash: %u of %u bytes written\n", size - remaining, size);
+		}
+		wheel++;
+	}
+	return true;
+}
+
+/* ftsFlash.c:flash_burn, with the firmware this panel names built into the kernel. */
+static void
+flash_burn(void)
+{
+	const uint8_t *fw = umi_fts_fw;
+	uint8_t reset[4] = { FTS_CMD_HW_REG, 0x00, 0x28, 0x80 };
+	uint8_t warm[4] = { FTS_CMD_HW_REG, (uint8_t)(ADDR_WARM_BOOT >> 8),
+		            (uint8_t)(ADDR_WARM_BOOT & 0xff), WARM_BOOT_VALUE };
+	uint8_t unlock[3] = { FLASH_CMD_UNLOCK, FLASH_UNLOCK_CODE0, FLASH_UNLOCK_CODE1 };
+	uint8_t erase_unlock[3] = { FLASH_CMD_WRITE_REGISTER, FLASH_ERASE_UNLOCK_CODE0,
+		                    FLASH_ERASE_UNLOCK_CODE1 };
+	uint8_t erase[3] = { FLASH_CMD_WRITE_REGISTER, FLASH_ERASE_CODE0, FLASH_ERASE_CODE1 };
+	uint32_t code_size, config_size;
+	uint8_t id[2];
+	bool ok;
+
+	if (UMI_FTS_FW_SIZE < FW_PAYLOAD_OFFSET + 4) {
+		printf("umi_touch: flash: the built-in firmware is too short\n");
+		return;
+	}
+	code_size = (uint32_t)fw[44] | (uint32_t)fw[45] << 8 |
+	    (uint32_t)fw[46] << 16 | (uint32_t)fw[47] << 24;
+	config_size = (uint32_t)fw[48] | (uint32_t)fw[49] << 8 |
+	    (uint32_t)fw[50] << 16 | (uint32_t)fw[51] << 24;
+	printf("umi_touch: flash: %u bytes of firmware: %u of code, %u of config\n",
+	    (unsigned)UMI_FTS_FW_SIZE, code_size, config_size);
+	if (FW_PAYLOAD_OFFSET + code_size + config_size != UMI_FTS_FW_SIZE) {
+		printf("umi_touch: flash: the header does not add up (%u + %u + %u != %u)\n",
+		    (unsigned)FW_PAYLOAD_OFFSET, code_size, config_size, (unsigned)UMI_FTS_FW_SIZE);
+		return;
+	}
+
+	printf("umi_touch: flash: 1) system reset\n");
+	fts_write_bytes(reset, sizeof(reset));
+	sleep_ms(50);
+
+	printf("umi_touch: flash: 2) warm boot\n");
+	if (!fts_write_bytes(warm, sizeof(warm))) {
+		printf("umi_touch: flash: the warm boot was not acknowledged, stopping\n");
+		return;
+	}
+	sleep_ms(50);
+
+	printf("umi_touch: flash: 3) unlock\n");
+	if (!fts_write_bytes(unlock, sizeof(unlock))) {
+		printf("umi_touch: flash: the unlock was not acknowledged, stopping\n");
+		return;
+	}
+	sleep_ms(50);
+
+	printf("umi_touch: flash: 4) erase unlock\n");
+	if (!fts_write_bytes(erase_unlock, sizeof(erase_unlock))) {
+		printf("umi_touch: flash: the erase unlock was not acknowledged, stopping\n");
+		return;
+	}
+	sleep_ms(50);
+
+	printf("umi_touch: flash: 5) erase\n");
+	if (!fts_write_bytes(erase, sizeof(erase)) || !flash_wait_ready(FLASH_ERASE_CODE0)) {
+		printf("umi_touch: flash: the erase did not complete, stopping\n");
+		return;
+	}
+
+	printf("umi_touch: flash: 6) program\n");
+	if (!flash_fill(0, fw + FW_PAYLOAD_OFFSET, code_size)) {
+		printf("umi_touch: flash: the program did not go in, stopping\n");
+		return;
+	}
+	printf("umi_touch: flash: 7) config\n");
+	if (!flash_fill(FLASH_ADDR_CONFIG_WORDS, fw + FW_PAYLOAD_OFFSET + code_size, config_size)) {
+		printf("umi_touch: flash: the config did not go in, stopping\n");
+		return;
+	}
+
+	printf("umi_touch: flash: 8) system reset\n");
+	fts_write_bytes(reset, sizeof(reset));
+	sleep_ms(200);
+
+	id[0] = id[1] = 0;
+	ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+	printf("umi_touch: flash: 9) id now: %s %02x %02x\n", ok ? "read" : "fail", id[0], id[1]);
+	if (id[0] || id[1]) {
+		printf("umi_touch: flash: the part is running its application\n");
+	} else {
+		printf("umi_touch: flash: still zero -- the loader took the image and did not start it\n");
+	}
+}
+
 static bool
 fts_write_registers(uint16_t address, const uint8_t *data, uint32_t length)
 {
@@ -2126,6 +2440,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t scan8 = 0;
 	uint32_t intmonarg = 0;
 	uint32_t pinswap = 0;
+	uint32_t flasharg = 0;
+	uint32_t burnarg = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -2155,6 +2471,8 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_scan8", &scan8, sizeof(scan8));
 	PE_parse_boot_argn("umi_touch_intmon", &intmonarg, sizeof(intmonarg));
 	intmon = intmonarg != 0;
+	PE_parse_boot_argn("umi_touch_flash", &flasharg, sizeof(flasharg));
+	PE_parse_boot_argn("umi_touch_burn", &burnarg, sizeof(burnarg));
 	/*
 	 * umi_touch_pinswap=1: the two lines the other way round, for every path in this file.
 	 *
@@ -2205,8 +2523,29 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * from and gpio69 the switch the fts node names, and the part still does not run on those two
 	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
-	if (sup || proto || bitsweep || scan8 || intmon) {
+	if (sup || proto || bitsweep || scan8 || intmon || flasharg || burnarg) {
 		power_up();
+	}
+	/*
+	 * umi_touch_flash=1: read the flash loader's own status registers and nothing else. This is
+	 * the run that says whether the thing answering at 0x49 has been the loader all along.
+	 */
+	if (flasharg) {
+		i2c_bus_recover();
+		flash_diagnostic();
+		thread_terminate(current_thread());
+		return;
+	}
+	/*
+	 * umi_touch_burn=1: write the firmware the device tree names into the part, following
+	 * ftsFlash.c step for step. Separate from the diagnostic on purpose -- this one changes the
+	 * chip, and it should only ever be run once the diagnostic has said the loader is there.
+	 */
+	if (burnarg) {
+		i2c_bus_recover();
+		flash_burn();
+		thread_terminate(current_thread());
+		return;
 	}
 	/*
 	 * umi_touch_intmon=1: see int_monitor(). Three reads at three rates, with every sample of
