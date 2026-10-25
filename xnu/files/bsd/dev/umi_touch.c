@@ -1091,7 +1091,6 @@ flash_burn(void)
 	uint8_t erase[3] = { FLASH_CMD_WRITE_REGISTER, FLASH_ERASE_CODE0, FLASH_ERASE_CODE1 };
 	uint32_t code_size, config_size;
 	uint8_t id[2];
-	bool ok;
 
 	if (UMI_FTS_FW_SIZE < FW_PAYLOAD_OFFSET + 4) {
 		printf("umi_touch: flash: the built-in firmware is too short\n");
@@ -1153,16 +1152,39 @@ flash_burn(void)
 
 	printf("umi_touch: flash: 8) system reset\n");
 	fts_write_bytes(reset, sizeof(reset));
-	sleep_ms(200);
 
-	id[0] = id[1] = 0;
-	ok = fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
-	printf("umi_touch: flash: 9) id now: %s %02x %02x\n", ok ? "read" : "fail", id[0], id[1]);
-	if (id[0] || id[1]) {
-		printf("umi_touch: flash: the part is running its application\n");
-	} else {
-		printf("umi_touch: flash: still zero -- the loader took the image and did not start it\n");
+	/*
+	 * How long the application takes to start after a reset is not known from here, and a single
+	 * read is not worth a second shot at the flash. Poll for it instead, and when it answers read
+	 * the firmware version it reports together with a page of the register file -- three things
+	 * that together say whether the image that was just written is the one now running.
+	 */
+	printf("umi_touch: flash: 9) did it come up?\n");
+	for (unsigned attempt = 0; attempt < 25; attempt++) {
+		uint8_t version[2];
+		uint8_t page[8];
+
+		version[0] = version[1] = 0;
+		for (unsigned j = 0; j < sizeof(page); j++) {
+			page[j] = 0;
+		}
+		id[0] = id[1] = 0;
+		fts_read_registers(FTS_CHIP_ID_ADDR_A, id, sizeof(id));
+		fts_read_registers(FTS_FW_VER_ADDR_A, version, sizeof(version));
+		fts_read_registers(0x0000, page, sizeof(page));
+		if (id[0] || id[1]) {
+			printf("umi_touch: flash: up after %u ms: id %02x %02x, fw version %02x %02x\n",
+			    (unsigned)(attempt + 1) * 100, id[0], id[1], version[0], version[1]);
+			printf("umi_touch: flash: 0x0000: ");
+			for (unsigned j = 0; j < sizeof(page); j++) {
+				printf("%02x ", page[j]);
+			}
+			printf("\n");
+			return;
+		}
+		sleep_ms(100);
 	}
+	printf("umi_touch: flash: still nothing after 2.5 s -- the loader took the image and never started it\n");
 }
 
 static bool
