@@ -537,6 +537,29 @@ read_chip_id(uint8_t *high, uint8_t *low)
 	    i2c_read_registers(FTS_REG_CHIP_ID_LOW, low, 1);
 }
 
+/*
+ * Can this pad drive the line both ways, and does the line come back when it is let go? A read of
+ * 0x00 with an acknowledge on every byte is not proof that a chip answered: if SDA is held low by
+ * anything at all -- an unpowered chip, a chip still in reset, a short -- then the acknowledge bit
+ * reads low too and every read returns zero. Driving the line low, then high, then letting the
+ * pull-up have it, and printing what the input reads each time, separates "the pad works and
+ * something else holds the line" from "this is not the line we think it is".
+ */
+static void
+line_test(void)
+{
+	for (int i = 0; i < 2; i++) {
+		unsigned pin = i ? PIN_SCL : PIN_SDA;
+
+		gpio_output(pin, false, PULL_NONE, 2);
+		printf("umi_touch: ... gpio%u driven low -> %u\n", pin, gpio_get(pin));
+		gpio_output(pin, true, PULL_NONE, 2);
+		printf("umi_touch: ... gpio%u driven high -> %u\n", pin, gpio_get(pin));
+		gpio_configure(pin, 0, PULL_UP, 2, false);
+		printf("umi_touch: ... gpio%u released, pull-up on -> %u\n", pin, gpio_get(pin));
+	}
+}
+
 /* One try at one pin order: reset the chip, let its firmware come up, ask who it is. */
 static bool
 probe(unsigned sda, unsigned scl, bool verbose)
@@ -696,6 +719,9 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	 * wrong way round is not an error the chip can report: it simply sees no valid start
 	 * condition. So both are tried, and only the one that answers is kept.
 	 */
+	if (stage >= 3) {
+		line_test();
+	}
 	for (int attempt = 0; attempt < 2 && !found; attempt++) {
 		unsigned sda = attempt == 0 ? PIN_SDA : PIN_SCL;
 		unsigned scl = attempt == 0 ? PIN_SCL : PIN_SDA;
