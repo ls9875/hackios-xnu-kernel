@@ -49,6 +49,7 @@
  *   umi_touch_pushpull=1  drive the high half of the clock rather than waiting for a pull-up,
  *                       for a board whose pull-ups are not powered in this boot environment
  *   umi_touch_cmd_db=1  print what RPMh can switch, with the address of each, and stop
+ *   umi_touch_scan=1    ask every address on the bus who is there, before anything else, and stop
  *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
  *                       low, 2 does not touch it -- one of the three is the chip out of reset
  *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
@@ -412,8 +413,40 @@ i2c_bus_recover(void)
 	printf("umi_touch: ... recover done, sda %u scl %u\n", gpio_get(pin_sda), gpio_get(pin_scl));
 }
 
-/* Write the register, repeat the start, read the bytes: the whole of I2C register access. */
+/*
+ * Ask every 7-bit address on the bus whether anyone is home: start, the address byte, look at the
+ * acknowledge, stop. Nothing is written anywhere and no register is read, so a scan cannot disturb
+ * whatever answers -- and it settles two questions at once. If nothing answers at any address, the
+ * bit-bang is producing something no device recognises, or nothing on that pair is powered. If
+ * something answers at an address other than 0x49, then the panel variant on this phone is not the
+ * one fts@49 describes: the same overlay carries focaltech@38 with the same supply.
+ */
 static bool
+i2c_address_present(uint8_t address)
+{
+	bool ack;
+
+	i2c_start();
+	ack = i2c_write_byte((uint8_t)(address << 1));
+	i2c_stop();
+	return ack;
+}
+
+static unsigned
+scan_bus(void)
+{
+	unsigned found = 0;
+
+	for (unsigned a = 0x08; a <= 0x77; a++) {
+		if (i2c_address_present((uint8_t)a)) {
+			printf("umi_touch:   %#04x acknowledges\n", a);
+			found++;
+		}
+	}
+	return found;
+}
+
+/* Write the register, repeat the start, read the bytes: the whole of I2C register access. */static bool
 i2c_read_registers(uint8_t reg, uint8_t *data, uint32_t length)
 {
 	bool ok = false;
@@ -813,6 +846,7 @@ static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, reg = 0, one = 0, pp = 0, cd = 0;
+	uint32_t sc = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -831,6 +865,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	if (bit_us < 1 || bit_us > 1000) {
 		bit_us = 3;
 	}
+	PE_parse_boot_argn("umi_touch_scan", &sc, sizeof(sc));
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
@@ -857,6 +892,27 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 
 	show_pins("as found");
+	/*
+	 * umi_touch_scan=1: who is on this bus at all, with the reset held one way and then the
+	 * other. It runs before anything is decided about the chip, because "no acknowledge at
+	 * 0x49" does not say whether the bus is dead or the address is wrong.
+	 */
+	if (sc) {
+		unsigned answered;
+
+		pins_for_i2c();
+		gpio_set(PIN_RESET, reset_mode != 0);
+		sleep_ms(200);
+		answered = scan_bus();
+		printf("umi_touch: scan with reset settled %s: %u answered\n",
+		    reset_mode ? "high" : "low", answered);
+		gpio_set(PIN_RESET, reset_mode == 0);
+		sleep_ms(200);
+		answered = scan_bus();
+		printf("umi_touch: scan with reset the other way: %u answered\n", answered);
+		thread_terminate(current_thread());
+		return;
+	}
 	if (stage <= 1) {
 		printf("umi_touch: stage %u -- the pins were read and nothing was written; stopping\n", stage);
 		thread_terminate(current_thread());
