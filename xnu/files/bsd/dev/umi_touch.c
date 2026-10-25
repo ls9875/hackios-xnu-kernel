@@ -1,7 +1,13 @@
 /*
- * The touch screen of the Xiaomi Mi 10 (umi): an ST FocalTech "st,fts" controller on the
+ * The touch screen of the Xiaomi Mi 10 (umi): an STMicroelectronics FingerTipS controller on the
  * SoC's I2C bus 3 at address 0x49, as a source of touches for /dev/redwood-touch
  * (sys/redwood_input.h). Only with boot-arg umi_touch=1.
+ *
+ * "fts" does not mean FocalTech here. The node is compatible = "st,fts" with
+ * fts,default-fw-name = "st_fts_j2.ftb", and the driver Android runs for it is
+ * drivers/input/touchscreen/st/ in Xiaomi's own kernel source (MiCode/Xiaomi_Kernel_OpenSource,
+ * branch umi-q-oss). That driver is the reference for everything in this file; this comment is
+ * not.
  *
  * Where every number comes from -- umi.dtb, the phone's own device tree, plus the dtbo
  * overlays the boot loader applies to it. The one that matters is overlay-17.dtbo entry 2,
@@ -27,15 +33,13 @@
  * the display and USB and nothing else -- so there is no firmware in the engine to talk to.
  * Instead gpio36 and gpio37 are reconfigured as GPIOs and I2C is driven by hand: open
  * drain, one pin per line, a few microseconds per half clock. I2C wants no clock, no DMA
- * and no engine, and the register protocol is plain -- write the register address, repeat
- * the start, read the bytes -- with none of the FTS 5.x SPI framing (7-byte header, dummy
- * bytes, CRC-16/Kermit) that bsd/dev/redwood_goodix.c has to carry for the same chip
- * family over SPI.
+ * and no engine, and the register protocol is plain once it is the right one -- a command
+ * byte 0xB6, a 16-bit address, and one dummy byte in front of the data on a read. See the
+ * protocol section below; getting that wrong is what made this chip look dead for a day.
  *
  * Diagnostics, because the first run is the one that has to say what the chip is:
- *   umi_touch_diag=1    after the chip ID, read all 256 registers a byte at a time and print
+ *   umi_touch_diag=1    after the chip ID, read hardware registers 0x0000..0x00ff and print
  *                       what came back: the chip's map, in the loader's log
- *   umi_touch_reg=N     read the touch report from register N instead of 0x01
  *   umi_touch_swap=1    start with the data and clock pins the other way round (the driver
  *                       tries both anyway; nothing is written down anywhere about which of
  *                       gpio36/gpio37 is SDA and which is SCL)
@@ -51,14 +55,13 @@
  *   umi_touch_cmd_db=1  print what RPMh can switch, with the address of each, and stop
  *   umi_touch_scan=1    ask every address on the bus who is there, before anything else, and stop
  *   umi_touch_supply=1  ask RPMh for pm8150a_l1 (ldoc1, 1.8 V) before touching the bus
- *   umi_touch_start=0   do not run the 0x55/0xAA start sequence before reading the chip ID
  *   umi_touch_diff=1    read the whole map three times and print only what changes between
- *   umi_touch_wtest=1   write a byte to three registers and read it back, then stop
+ *   umi_touch_wtest=1   read the ID and the firmware version five times, then stop: a stable
+ *                       pair proves the dummy byte is being dropped in the right place
  *   umi_touch_settle_ms=N  how long the chip gets between the reset and the first read (200)
- *   umi_touch_reg16=1   send a two-byte register address instead of one
- *   umi_touch_sweep=1   try every protocol variant in one boot and print one line each
+ *   umi_touch_sweep=1   try both ID/firmware address pairs at both bus addresses, one line each
  *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
- *                       low, 2 does not touch it -- one of the three is the chip out of reset
+ *                       low, 2 does not touch it
  *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
  */
 #include <kern/clock.h>
@@ -121,30 +124,70 @@ extern kern_return_t thread_terminate(thread_t thread);
 
 #define I2C_ADDRESS              0x49    /* fts@49 */
 
-#define FTS_REG_CHIP_ID_HIGH     0xa3
-#define FTS_REG_CHIP_ID_LOW      0x9f
-#define FTS_REG_TOUCH_DATA       0x01
+/* ---- the protocol: STMicroelectronics FingerTipS, not FocalTech ------------------------------- */
 
 /*
- * Starting the chip: 0xAA written to register 0x55, 12 ms, then the boot ID at register 0x90.
- * bsd/dev/redwood_goodix.c carries the same three numbers for the FT3680 (FTS_CMD_START1,
- * FTS_CMD_START2, FTS_CMD_START_DELAY, FTS_CMD_READ_BOOT_ID) and expects 0x56 0x62 back.
+ * "fts" here does not mean FocalTech. umi's node is compatible = "st,fts" with
+ * fts,default-fw-name = "st_fts_j2.ftb", and the driver Android runs for it is
+ * drivers/input/touchscreen/st/ in Xiaomi's own kernel source (branch umi-q-oss of
+ * MiCode/Xiaomi_Kernel_OpenSource). Every number below is taken from that driver, and it is a
+ * different protocol from the one this file was written to.
+ *
+ * There is no linear register file. An access is a command carrying a *16-bit* address, and a read
+ * answers with one dummy byte in front of the data:
+ *
+ *   read    [0xB6, addr_hi, addr_lo]  + repeated start + (1 dummy + N) bytes   ftsIO.c:readCmdU16
+ *   write   [0xB6, addr_hi, addr_lo, data ...]  in one transaction             ftsIO.c:writeCmdU16
+ *
+ * Reading 0x00..0xFF with an 8-bit address -- what this driver used to do -- cannot work: the chip
+ * takes the register byte as the high half of an address, waits for a low half that never comes,
+ * and answers nothing. That is exactly the map it produced: 252 registers reading 0x00, writes
+ * acknowledged and not sticking, and a chip ID of 00 00. It was not a dead chip.
  */
-#define FTS_CMD_START_REGISTER   0x55
-#define FTS_CMD_START_VALUE      0xaa
-#define FTS_CMD_BOOT_ID          0x90
-#define FTS_MAX_TOUCHES          10      /* focaltech,max-touch-number */
-#define FTS_REPORT_LENGTH        (2 + 6 * FTS_MAX_TOUCHES)
+#define FTS_CMD_HW_REG           0xb6    /* FTS_CMD_HW_REG_R and _W are the same opcode */
+#define FTS_CMD_READ_ONE         0x85    /* FIFO_CMD_READONE: one event, FTS_EVENT_SIZE bytes */
+#define FTS_CMD_SENSE_ON         0x93    /* FTS_CMD_MS_MT_SENSE_ON: start scanning the panel */
+#define FTS_IER_ADDR             0x001c  /* IER_ADDR */
+#define FTS_IER_ENABLE           0x41    /* IER_ENABLE: let the chip drive the interrupt line */
+#define FTS_EVENT_SIZE           8       /* FIFO_EVENT_SIZE */
+#define FTS_FIFO_DEPTH           32      /* FIFO_DEPTH */
 
-#define FTS_EVENT_DOWN           0
-#define FTS_EVENT_UP             1
-#define FTS_EVENT_CONTACT        2
+/*
+ * FTM3_CHIP is a compile-time switch in the vendor driver and it moves the ID, the firmware
+ * version and the reset register. Nothing here says which one umi is, so both are tried: the set
+ * that answers is the set this phone has.
+ */
+#define FTS_CHIP_ID_ADDR_A       0x0004  /* DCHIP_ID_ADDR, FTM3_CHIP undefined */
+#define FTS_CHIP_ID_ADDR_B       0x0007  /* DCHIP_ID_ADDR, FTM3_CHIP defined */
+#define FTS_FW_VER_ADDR_A        0x0008  /* DCHIP_FW_VER_ADDR, undefined */
+#define FTS_FW_VER_ADDR_B        0x000a  /* defined */
+#define FTS_SYS_RESET_ADDR_A     0x0028  /* SYSTEM_RESET_ADDRESS, undefined */
+#define FTS_SYS_RESET_VAL_A      0x80    /* SYSTEM_RESET_VALUE */
+#define FTS_SYS_RESET_ADDR_B     0x0023  /* defined */
+#define FTS_SYS_RESET_VAL_B      0x01
+#define FTS_FW_VER_BYTES         2       /* DCHIP_FW_VER_BYTE */
+
+#define FTS_ID_0_A               0x36    /* DCHIP_ID_0, DCHIP_ID_1: undefined */
+#define FTS_ID_1_A               0x70
+#define FTS_ID_0_B               0x39    /* FTM3_CHIP defined */
+#define FTS_ID_1_B               0x6c
+
+/* Event ids, ftsSoftware.h. A pointer event is 8 bytes; see parse_event() for the layout. */
+#define EVENTID_NO_EVENT         0x00
+#define EVENTID_ENTER_POINTER    0x03
+#define EVENTID_LEAVE_POINTER    0x04
+#define EVENTID_MOTION_POINTER   0x05
+#define EVENTID_ERROR_EVENT      0x0f
+#define EVENTID_CONTROL_READY    0x10
+#define EVENTID_STATUS_UPDATE    0x16
+#define EVENTID_ECHO             0xec
+
+#define FTS_MAX_TOUCHES          10      /* focaltech,max-touch-number, and ABS_MT_SLOT max 9 */
 
 static vm_offset_t tlmm_west, tlmm_south, tlmm_north;
 static vm_offset_t tlmm_one;            /* umi_touch_gpio: put every pin at this base instead */
 static uint32_t stage = 9;              /* umi_touch_stage */
 static uint32_t reset_mode = 1;         /* umi_touch_reset: the level the reset sequence settles at */
-static bool start_chip = true;          /* umi_touch_start: run the 0x55/0xAA sequence */
 static uint32_t settle_ms = 200;        /* umi_touch_settle_ms: how long the chip gets after reset */
 
 /* Which tile a pin's registers live in, out of the table described above. */
@@ -287,16 +330,10 @@ static uint32_t bit_us = 3;         /* a half clock; about 150 kHz with 3 */
  */
 static bool pushpull;
 /*
- * umi_touch_reg16=1 sends two address bytes, 0x00 and then the register, instead of one.
- *
- * It is here because of what this chip does with one: the address byte is acknowledged, the
- * register byte is acknowledged, the data comes back 0x00, and a write into any register is
- * acknowledged and does not stick. That is also exactly what a part expecting a 16-bit register
- * address would do when handed eight -- consume the register byte as its high half, wait for a
- * low half that never comes, and answer nothing. One boot argument tells the two apart.
+ * The old umi_touch_reg16 and umi_touch_sweep arguments that used to live here are gone with the
+ * 8-bit register model they existed to test. The answer they were looking for is in the protocol
+ * section above: the address is 16 bits, always, and it is not a variant to try.
  */
-static bool reg16;
-static bool norepeat;                   /* umi_touch_sweep: stop, then start again, instead of repeating */
 static uint8_t bus_address = I2C_ADDRESS;
 
 /*
@@ -497,21 +534,94 @@ scan_bus(void)
 	return found;
 }
 
-/* Write the register, repeat the start, read the bytes: the whole of I2C register access. */static bool
-i2c_read_registers(uint8_t reg, uint8_t *data, uint32_t length)
+/* ---- the FingerTipS protocol on top of the bit-bang -------------------------------------------- */
+
+/*
+ * Read `length` bytes of the hardware register at `address`.
+ *
+ * ftsIO.c:readCmdU16 writes {0xB6, hi, lo}, repeats the start, and reads length + 1 bytes because
+ * the chip puts one dummy byte in front of the data (DUMMY_HW_REG is 1 for every hardware register
+ * in this part). Dropping that byte is the whole difference between the data and garbage shifted
+ * by one, and it is not optional: it is how the vendor driver reads the firmware version.
+ */
+static bool
+fts_read_registers(uint16_t address, uint8_t *data, uint32_t length)
+{
+	uint8_t buf[FTS_FIFO_DEPTH + 1];
+	bool ok = false;
+
+	if (length > sizeof(buf) - 1) {
+		return false;
+	}
+	i2c_start();
+	if (i2c_write_byte((uint8_t)(bus_address << 1)) &&
+	    i2c_write_byte(FTS_CMD_HW_REG) &&
+	    i2c_write_byte((uint8_t)(address >> 8)) &&
+	    i2c_write_byte((uint8_t)(address & 0xff))) {
+		i2c_start();
+		if (i2c_write_byte((uint8_t)(bus_address << 1 | 1))) {
+			for (uint32_t i = 0; i <= length; i++) {
+				buf[i] = i2c_read_byte(i < length);
+			}
+			memcpy(data, buf + 1, length);
+			ok = true;
+		}
+	}
+	i2c_stop();
+	return ok;
+}
+
+/* ftsIO.c:writeCmdU16 -- the command, both address bytes and the data in one transaction. */
+static bool
+fts_write_registers(uint16_t address, const uint8_t *data, uint32_t length)
+{
+	bool ok;
+
+	i2c_start();
+	ok = i2c_write_byte((uint8_t)(bus_address << 1)) &&
+	    i2c_write_byte(FTS_CMD_HW_REG) &&
+	    i2c_write_byte((uint8_t)(address >> 8)) &&
+	    i2c_write_byte((uint8_t)(address & 0xff));
+	for (uint32_t i = 0; ok && i < length; i++) {
+		ok = i2c_write_byte(data[i]);
+	}
+	i2c_stop();
+	return ok;
+}
+
+/*
+ * A command is a single byte out and nothing back -- ftsIO.c:fts_writeCmd with a one-byte buffer.
+ * The event read is the same shape with bytes coming back, and the sense-on command is a bare
+ * command with no address and no answer.
+ */
+static bool
+fts_command(uint8_t command)
+{
+	bool ok;
+
+	i2c_start();
+	ok = i2c_write_byte((uint8_t)(bus_address << 1)) && i2c_write_byte(command);
+	i2c_stop();
+	return ok;
+}
+
+/*
+ * One event out of the FIFO: a single command byte, 0x85, then eight bytes back (fts.c:
+ * fts_event_handler). There is no dummy byte here -- that is only for hardware registers -- and no
+ * address. The first byte of the event is its id, and 0x00 means the FIFO is empty.
+ */
+static bool
+fts_read_event(uint8_t *event)
 {
 	bool ok = false;
 
 	i2c_start();
-	if (i2c_write_byte(bus_address << 1) && (reg16 ? i2c_write_byte(0x00) : true) &&
-	    i2c_write_byte(reg)) {
-		if (norepeat) {
-			i2c_stop();
-		}
-		i2c_start();                                   /* repeated start, unless asked for a stop */
-		if (i2c_write_byte(bus_address << 1 | 1)) {
-			for (uint32_t i = 0; i < length; i++) {
-				data[i] = i2c_read_byte(i + 1 < length);
+	if (i2c_write_byte((uint8_t)(bus_address << 1)) &&
+	    i2c_write_byte(FTS_CMD_READ_ONE)) {
+		i2c_start();
+		if (i2c_write_byte((uint8_t)(bus_address << 1 | 1))) {
+			for (uint32_t i = 0; i < FTS_EVENT_SIZE; i++) {
+				event[i] = i2c_read_byte(i + 1 < FTS_EVENT_SIZE);
 			}
 			ok = true;
 		}
@@ -520,24 +630,8 @@ i2c_read_registers(uint8_t reg, uint8_t *data, uint32_t length)
 	return ok;
 }
 
-static bool
-i2c_write_registers(uint8_t reg, const uint8_t *data, uint32_t length)
-{
-	bool ok;
-
-	i2c_start();
-	ok = i2c_write_byte(bus_address << 1) && (reg16 ? i2c_write_byte(0x00) : true) &&
-	    i2c_write_byte(reg);
-	for (uint32_t i = 0; ok && i < length; i++) {
-		ok = i2c_write_byte(data[i]);
-	}
-	i2c_stop();
-	return ok;
-}
-
 /* ---- the chip ----------------------------------------------------------------------------------- */
 
-static uint32_t touch_register = FTS_REG_TOUCH_DATA;
 static uint32_t flip;              /* boot-arg umi_touch_flip */
 
 static struct {
@@ -545,36 +639,22 @@ static struct {
 } seen;
 
 static struct {
-	bool down, seen;
+	bool down;
 	uint32_t x, y;
 } contact[FTS_MAX_TOUCHES];
 
-/*
- * The report at register 0x01, in the layout the vendor's focaltech_core.c reads it (the
- * same offsets bsd/dev/redwood_goodix.c uses for the SPI variant of this chip family):
- *   report[0]            gesture (0 outside gesture mode)
- *   report[1]            (chip type << 4) | finger count
- *   report[2 + 6*i + 0]  E_XH:  [7:6] event (0 down, 1 up, 2 contact), [3:0] x bits 14..11
- *   report[2 + 6*i + 1]  XL:    x bits 10..3
- *   report[2 + 6*i + 2]  ID_YH: [7:4] finger id, [3:0] y bits 14..11
- *   report[2 + 6*i + 3]  YL:    y bits 10..3
- *   report[2 + 6*i + 4]  PRE:   [7:5] x bits 2..0, [4:2] y bits 2..0
- *   report[2 + 6*i + 5]  AREA:  touch area
- * Both axes are 15 bits; the panel is 1080 x 2340.
- */
-#define PANEL_X 1080
-#define PANEL_Y 2340
+#define PANEL_X 1080               /* fts,x-max */
+#define PANEL_Y 2340               /* fts,y-max */
 
 static void
-report_touch(uint32_t id, uint32_t event, uint32_t x, uint32_t y)
+report_touch(uint32_t id, bool down, uint32_t x, uint32_t y)
 {
 	static unsigned shown;
 
 	if (id >= FTS_MAX_TOUCHES) {
 		return;
 	}
-	if (event == FTS_EVENT_UP) {
-		contact[id].seen = true;
+	if (!down) {
 		if (contact[id].down) {
 			contact[id].down = false;
 			redwood_touch_post(REDWOOD_TOUCH_UP, id, contact[id].x, contact[id].y);
@@ -591,64 +671,43 @@ report_touch(uint32_t id, uint32_t event, uint32_t x, uint32_t y)
 	}
 	x = (uint32_t)(((uint64_t)x * 65535) / (PANEL_X - 1));
 	y = (uint32_t)(((uint64_t)y * 65535) / (PANEL_Y - 1));
-	contact[id].seen = true;
 	if (!contact[id].down) {
 		contact[id].down = true;
 		redwood_touch_post(REDWOOD_TOUCH_DOWN, id, x, y);
+		if (shown++ < 8) {
+			printf("umi_touch: finger %u down at %u, %u\n", id, x, y);
+		}
 	} else if (contact[id].x != x || contact[id].y != y) {
 		redwood_touch_post(REDWOOD_TOUCH_MOVE, id, x, y);
 	}
 	contact[id].x = x;
 	contact[id].y = y;
-	if (shown++ < 8) {
-		printf("umi_touch: finger %u %s at %u, %u\n", id,
-		    event == FTS_EVENT_DOWN ? "down" : "move", x, y);
-	}
 }
 
+/*
+ * One event out of the FIFO, in the layout fts.c reads it (fts_enter_pointer_event_handler and
+ * fts_leave_pointer_event_handler):
+ *   event[0]   event id: 0x03 enter, 0x04 leave, 0x05 motion (the same handler as enter)
+ *   event[1]   [7:4] how many fingers are down, [3:0] this finger's slot
+ *   event[2]   x bits 11..4
+ *   event[3]   y bits 11..4
+ *   event[4]   [7:4] x bits 3..0, [3:0] y bits 3..0
+ *   event[5]   [4:0] touch major, [7:6] touch size
+ *   event[6]   touch minor
+ *
+ * Unlike the FocalTech report this file used to parse, the chip sends one event per finger per
+ * change and nothing at all when nothing happens -- so a lifted finger is an 0x04 event with its
+ * slot in event[1], not a slot that has gone missing from a snapshot.
+ */
 static void
-parse_report(const uint8_t *report)
+parse_event(const uint8_t *event)
 {
-	/*
-	 * report[1]'s low nibble is how many fingers the chip is reporting. It is not decoration:
-	 * a report of all zeros is what a bus that reads back nothing looks like, and taking its
-	 * ten empty slots at face value -- id 0, event 0 (down), x and y zero -- posted a finger
-	 * pressed in the top-left corner every 16 ms for as long as the run lasted.
-	 */
-	uint32_t fingers = report[1] & 0x0f;
+	uint32_t id = event[1] & 0x0f;
+	uint32_t x = ((uint32_t)event[2] << 4) | ((event[4] & 0xf0) >> 4);
+	uint32_t y = ((uint32_t)event[3] << 4) | (event[4] & 0x0f);
 
-	for (uint32_t i = 0; i < FTS_MAX_TOUCHES; i++) {
-		contact[i].seen = false;
-	}
-	if (fingers == 0 || fingers > FTS_MAX_TOUCHES) {
-		for (uint32_t i = 0; i < FTS_MAX_TOUCHES; i++) {
-			if (contact[i].down) {
-				contact[i].down = false;
-				redwood_touch_post(REDWOOD_TOUCH_UP, i, contact[i].x, contact[i].y);
-			}
-		}
-		return;
-	}
-	for (uint32_t i = 0; i < fingers; i++) {
-		const uint8_t *t = report + 2 + 6 * i;
-		uint32_t id = (t[2] >> 4) & 0x0f;
-		uint32_t event, x, y;
-
-		if (id >= FTS_MAX_TOUCHES) {
-			break;                  /* no more valid slots in this report */
-		}
-		event = (t[0] >> 6) & 0x3;
-		x = ((uint32_t)(t[0] & 0x0f) << 11) | ((uint32_t)t[1] << 3) | ((uint32_t)t[4] >> 5);
-		y = ((uint32_t)(t[2] & 0x0f) << 11) | ((uint32_t)t[3] << 3) | (((uint32_t)t[4] & 0x1c) >> 2);
-		report_touch(id, event, x, y);
-	}
-	/* a finger that is no longer in the report has lifted */
-	for (uint32_t i = 0; i < FTS_MAX_TOUCHES; i++) {
-		if (!contact[i].seen && contact[i].down) {
-			contact[i].down = false;
-			redwood_touch_post(REDWOOD_TOUCH_UP, i, contact[i].x, contact[i].y);
-		}
-	}
+	seen.reports++;
+	report_touch(id, event[0] != EVENTID_LEAVE_POINTER, x, y);
 }
 
 /* ---- bring-up ----------------------------------------------------------------------------------- */
@@ -660,13 +719,6 @@ pins_for_i2c(void)
 	scl_high();
 	gpio_output(PIN_RESET, false, PULL_UP, 8);      /* held in reset until the chip is asked for */
 	gpio_configure(PIN_INT, 0, PULL_UP, 8, false);
-}
-
-static bool
-read_chip_id(uint8_t *high, uint8_t *low)
-{
-	return i2c_read_registers(FTS_REG_CHIP_ID_HIGH, high, 1) &&
-	    i2c_read_registers(FTS_REG_CHIP_ID_LOW, low, 1);
 }
 
 /*
@@ -708,6 +760,52 @@ line_test(void)
 	/* leave the pair as the driver will use them */
 	gpio_configure(PIN_SDA, 0, PULL_UP, 2, false);
 	gpio_configure(PIN_SCL, 0, PULL_UP, 2, false);
+}
+
+/*
+ * Who is this, really, and is it running?
+ *
+ * Both of the vendor driver's compile-time variants are asked, because nothing here says which one
+ * umi is: the digital chip ID and the firmware version live at 0x0004/0x0008 without FTM3_CHIP and
+ * at 0x0007/0x000a with it, and the expected ID pairs are 36 70 and 39 6c. Whichever answers is
+ * this phone's part -- and the answer is also the first proof that the protocol is right at all:
+ * a 16-bit address, command 0xB6, and one dummy byte in front of the data.
+ */
+static bool
+read_chip_id(uint8_t *high, uint8_t *low)
+{
+	static const struct {
+		uint16_t id, fw;
+		uint8_t id0, id1;
+		const char *name;
+	} variant[2] = {
+		{ FTS_CHIP_ID_ADDR_A, FTS_FW_VER_ADDR_A, FTS_ID_0_A, FTS_ID_1_A, "without FTM3_CHIP" },
+		{ FTS_CHIP_ID_ADDR_B, FTS_FW_VER_ADDR_B, FTS_ID_0_B, FTS_ID_1_B, "with FTM3_CHIP" },
+	};
+	bool any = false;
+
+	for (unsigned v = 0; v < 2; v++) {
+		uint8_t id[2] = { 0, 0 };
+		uint8_t fw[FTS_FW_VER_BYTES] = { 0, 0 };
+		bool id_ok, fw_ok;
+
+		id_ok = fts_read_registers(variant[v].id, id, sizeof(id));
+		fw_ok = fts_read_registers(variant[v].fw, fw, sizeof(fw));
+		if (!id_ok) {
+			continue;
+		}
+		any = true;
+		printf("umi_touch: id at %#06x %s: %02x %02x%s; fw at %#06x: %02x %02x%s\n",
+		    variant[v].id, variant[v].name, id[0], id[1],
+		    (id[0] == variant[v].id0 && id[1] == variant[v].id1) ? " -- that is this part" : "",
+		    variant[v].fw, fw[0], fw_ok ? fw[1] : 0, fw_ok ? "" : " (read failed)");
+		if (id[0] == variant[v].id0 && id[1] == variant[v].id1) {
+			*high = id[0];
+			*low = id[1];
+			return true;
+		}
+	}
+	return any && false;
 }
 
 /* One try at one pin order: reset the chip, let its firmware come up, ask who it is. */
@@ -760,29 +858,32 @@ probe(unsigned sda, unsigned scl, bool verbose)
 		trace("200 ms later");
 	}
 	/*
-	 * The chip does not answer at its ID registers until it has been started. Focaltech's own
-	 * sequence -- the one bsd/dev/redwood_goodix.c uses for the FT3680 over SPI -- is a write of
-	 * 0xAA to register 0x55, a 12 ms wait, then two bytes from register 0x90: the boot ID, which
-	 * is 0x56 0x62 for that family. A chip that has not been started answers there and nowhere
-	 * else, which is what the 256-register map looks like now that the bus is powered: four
-	 * non-zero bytes and 252 zeros.
+	 * The vendor driver's fts_chip_powercycle2, in its order: assert the reset (low), bring the
+	 * supplies up, give the regulators 20 ms to reach their value, wait another 20 ms, then
+	 * release the reset (high). So the reset line is active low and the chip is out of reset at
+	 * the level this driver has always settled at -- which is also what the bus said when it
+	 * was measured: reset low reads 0xff and writes are not acknowledged, reset high reads
+	 * 0x00 and they are. Nothing needs to be started by hand; there is no 0x55/0xAA handshake
+	 * on this part, that was FocalTech's and this is not a FocalTech.
 	 */
-	if (start_chip) {
-		static const uint8_t aa = FTS_CMD_START_VALUE;
-		uint8_t boot[2] = { 0, 0 };
+	if (reset_mode != 2) {
+		bool settle_high = reset_mode != 0;
 
-		if (i2c_write_registers(FTS_CMD_START_REGISTER, &aa, 1)) {
-			sleep_ms(12);
-			if (i2c_read_registers(FTS_CMD_BOOT_ID, boot, 2)) {
-				printf("umi_touch: boot ID at %#x: %02x %02x%s\n", FTS_CMD_BOOT_ID, boot[0], boot[1],
-				    (boot[0] == 0x56 && boot[1] == 0x62) ? " -- the Focaltech ROM answered" : "");
-			} else {
-				printf("umi_touch: no answer at the boot ID, %#x\n", FTS_CMD_BOOT_ID);
-			}
-		} else {
-			printf("umi_touch: could not write %#x to %#x to start the chip\n",
-			    FTS_CMD_START_VALUE, FTS_CMD_START_REGISTER);
+		gpio_set(PIN_RESET, !settle_high);
+		sleep_ms(2);
+		if (verbose) {
+			trace("2 ms pulsed the other way");
 		}
+		gpio_set(PIN_RESET, settle_high);
+		if (verbose) {
+			trace(settle_high ? "reset settled high" : "reset settled low");
+		}
+	} else if (verbose) {
+		trace("reset left where it was");
+	}
+	sleep_ms(settle_ms);              /* the chip's own boot, then its firmware */
+	if (verbose) {
+		trace("settle time later");
 	}
 
 	for (int attempt = 0; attempt < 5; attempt++) {
@@ -790,24 +891,21 @@ probe(unsigned sda, unsigned scl, bool verbose)
 			trace("asking who it is");
 		}
 		if (read_chip_id(&high, &low)) {
-			if (high != 0xff || low != 0xff) {
-				if (verbose) {
-					printf("umi_touch: chip at %#x on sda gpio%u / scl gpio%u: id %02x %02x (after %d attempt(s))\n",
-					    I2C_ADDRESS, pin_sda, pin_scl, high, low, attempt + 1);
-				}
-				return true;
-			}
-		} else {
-			seen.no_ack++;
 			if (verbose) {
-				printf("umi_touch: ... attempt %d: no acknowledge\n", attempt + 1);
+				printf("umi_touch: chip at %#x on sda gpio%u / scl gpio%u: id %02x %02x (after %d attempt(s))\n",
+				    I2C_ADDRESS, pin_sda, pin_scl, high, low, attempt + 1);
 			}
+			return true;
+		}
+		seen.no_ack++;
+		if (verbose) {
+			printf("umi_touch: ... attempt %d: nothing at the id registers\n", attempt + 1);
 		}
 		sleep_ms(50);
 	}
 	if (verbose) {
-		printf("umi_touch: no answer at %#x on sda gpio%u / scl gpio%u (last read %02x %02x)\n",
-		    I2C_ADDRESS, pin_sda, pin_scl, high, low);
+		printf("umi_touch: no answer at %#x on sda gpio%u / scl gpio%u\n",
+		    I2C_ADDRESS, pin_sda, pin_scl);
 	}
 	return false;
 }
@@ -817,15 +915,16 @@ register_dump(void)
 {
 	uint8_t line[16];
 
-	printf("umi_touch: registers at %#x (sda gpio%u, scl gpio%u):\n", I2C_ADDRESS, pin_sda, pin_scl);
+	printf("umi_touch: hardware registers 0x0000..0x00ff at %#x (sda gpio%u, scl gpio%u):\n",
+	    I2C_ADDRESS, pin_sda, pin_scl);
 	for (unsigned base = 0; base < 256; base += 16) {
 		for (unsigned i = 0; i < 16; i++) {
 			line[i] = 0xff;
-			if (!i2c_read_registers((uint8_t)(base + i), &line[i], 1)) {
+			if (!fts_read_registers((uint16_t)(base + i), &line[i], 1)) {
 				line[i] = 0xfe;    /* no acknowledge */
 			}
 		}
-		printf("umi_touch: %02x: %02x %02x %02x %02x %02x %02x %02x %02x "
+		printf("umi_touch: %04x: %02x %02x %02x %02x %02x %02x %02x %02x "
 		    "%02x %02x %02x %02x %02x %02x %02x %02x\n", base,
 		    line[0], line[1], line[2], line[3], line[4], line[5], line[6], line[7],
 		    line[8], line[9], line[10], line[11], line[12], line[13], line[14], line[15]);
@@ -846,7 +945,7 @@ register_diff(void)
 
 	for (unsigned i = 0; i < 256; i++) {
 		before[i] = 0xff;
-		if (!i2c_read_registers((uint8_t)i, &before[i], 1)) {
+		if (!fts_read_registers((uint16_t)i, &before[i], 1)) {
 			before[i] = 0xfe;
 		}
 	}
@@ -856,13 +955,13 @@ register_diff(void)
 		sleep_ms(200);
 		for (unsigned i = 0; i < 256; i++) {
 			after[i] = 0xff;
-			if (!i2c_read_registers((uint8_t)i, &after[i], 1)) {
+			if (!fts_read_registers((uint16_t)i, &after[i], 1)) {
 				after[i] = 0xfe;
 			}
 		}
 		for (unsigned i = 0; i < 256; i++) {
 			if (before[i] != after[i]) {
-				printf("umi_touch:   %02x: %02x -> %02x\n", i, before[i], after[i]);
+				printf("umi_touch:   %04x: %02x -> %02x\n", i, before[i], after[i]);
 				changed++;
 				before[i] = after[i];
 			}
@@ -872,125 +971,102 @@ register_diff(void)
 }
 
 /*
- * Do writes stick? Reading tells us what the chip says about itself; writing a byte and reading it
- * back tells us whether anything behind the I2C slave is alive at all. A part that acknowledges its
- * address, answers 0 for 252 of its 256 registers and ignores a write has its bus interface up and
- * nothing behind it -- which is what a controller that has not been given its application firmware
- * looks like. Each register is put back the way it was found.
+ * Is the answer stable, and does it depend on the dummy byte?
+ *
+ * This used to write a byte and read it back to see whether anything behind the I2C slave was
+ * alive. That question is answered: the protocol was wrong, not the chip, and nothing here writes
+ * to a register whose meaning is not known -- 0x0024 is the interface control register and writing
+ * the wrong value to it switches the part to SPI. So the test reads the ID and the firmware version
+ * five times instead, which is what proves the dummy byte is being dropped in the right place: a
+ * misaligned read shifts by one and the same two bytes come back as a different pair every time.
  */
 static void
 write_test(void)
 {
-	static const uint8_t where[3] = { 0x50, 0xa5, 0x20 };
+	for (int i = 0; i < 5; i++) {
+		uint8_t id[2] = { 0, 0 }, fw[2] = { 0, 0 };
 
-	for (unsigned i = 0; i < sizeof(where); i++) {
-		uint8_t old = 0xff, now = 0xff, back = 0xff, five_a = 0x5a;
-		bool old_ok, wrote;
-
-		old_ok = i2c_read_registers(where[i], &old, 1);
-		wrote = i2c_write_registers(where[i], &five_a, 1);
-		(void)i2c_read_registers(where[i], &now, 1);
-		if (old_ok) {
-			(void)i2c_write_registers(where[i], &old, 1);
-			(void)i2c_read_registers(where[i], &back, 1);
-		}
-		printf("umi_touch: %#04x: read %02x; write 5a %s; reads %02x; put back %02x\n",
-		    where[i], old, wrote ? "acked" : "not acked", now, back);
+		(void)fts_read_registers(FTS_CHIP_ID_ADDR_A, id, 2);
+		(void)fts_read_registers(FTS_FW_VER_ADDR_A, fw, 2);
+		printf("umi_touch: read %d: id %02x %02x fw %02x %02x\n", i, id[0], id[1], fw[0], fw[1]);
+		sleep_ms(20);
 	}
 }
 
 /*
- * Every protocol variant this chip could want, tried in one boot, printed one line each.
+ * The parts of the protocol that could still be wrong, tried in one boot, one line each.
  *
- * One experiment per build was the wrong shape: each answer cost a rebuild, a download and a
- * reboot, and the phone sat in the loader between them. Nothing here is destructive and every
- * combination takes milliseconds, so they all go in one run: eight or sixteen bit register
- * addressing, repeated start or stop-then-start, the two addresses the panel overlays name, and
- * with or without Focaltech's 0x55/0xAA start sequence. What a working variant looks like is the
- * chip ID at fts,x-max's driver registers -- 0x56 0x62 for the FT3680 family -- or at least a
- * register map with structure in it instead of four bytes.
+ * The command byte, the 16-bit address and the dummy byte are fixed by the vendor driver, so what
+ * is left is: which of the two compile-time variants this part is (0x0004/0x0008 without FTM3_CHIP
+ * or 0x0007/0x000a with it), whether the dummy byte is really there, and which of the two addresses
+ * the overlay names answers. A combination that reads back 36 70 or 39 6c has settled all of it.
  */
 static void
 sweep(void)
 {
 	static const uint8_t addresses[2] = { 0x49, 0x38 };
+	static const struct {
+		uint16_t id, fw;
+		const char *name;
+	} variant[2] = {
+		{ FTS_CHIP_ID_ADDR_A, FTS_FW_VER_ADDR_A, "0x0004/0x0008" },
+		{ FTS_CHIP_ID_ADDR_B, FTS_FW_VER_ADDR_B, "0x0007/0x000a" },
+	};
 
-	/*
-	 * Every combination has to fit in about a second: this kernel reaches bsd_init and panics on
-	 * the missing launchd roughly 1.4 s after the driver starts, and a 256-register dump per
-	 * combination spends that budget on two of sixteen. So a combination costs seven transfers --
-	 * boot ID, both ID bytes, four registers that were non-zero, and a write-and-read-back -- and
-	 * only a combination that looks interesting pays for the whole map.
-	 */
 	for (unsigned a = 0; a < 2; a++) {
-		for (unsigned r16 = 0; r16 < 2; r16++) {
-			for (unsigned nr = 0; nr < 2; nr++) {
-				for (unsigned st = 0; st < 2; st++) {
-					uint8_t idh = 0, idl = 0, boot[2] = { 0, 0 };
-					uint8_t probe_old = 0, probe_now = 0, five_a = 0x5a;
-					uint8_t r86 = 0, ra6 = 0, ra8 = 0, rfa = 0;
-					bool stuck, interesting;
+		bus_address = addresses[a];
+		for (unsigned v = 0; v < 2; v++) {
+			uint8_t with_dummy[2] = { 0, 0 }, fw[2] = { 0, 0 };
 
-					bus_address = addresses[a];
-					reg16 = r16 != 0;
-					norepeat = nr != 0;
-					if (st) {
-						uint8_t aa = FTS_CMD_START_VALUE;
-
-						(void)i2c_write_registers(FTS_CMD_START_REGISTER, &aa, 1);
-						sleep_ms(12);
-					}
-					(void)i2c_read_registers(FTS_CMD_BOOT_ID, boot, 2);
-					(void)i2c_read_registers(FTS_REG_CHIP_ID_HIGH, &idh, 1);
-					(void)i2c_read_registers(FTS_REG_CHIP_ID_LOW, &idl, 1);
-					(void)i2c_read_registers(0x86, &r86, 1);
-					(void)i2c_read_registers(0xa6, &ra6, 1);
-					(void)i2c_read_registers(0xa8, &ra8, 1);
-					(void)i2c_read_registers(0xfa, &rfa, 1);
-					(void)i2c_read_registers(0x50, &probe_old, 1);
-					(void)i2c_write_registers(0x50, &five_a, 1);
-					(void)i2c_read_registers(0x50, &probe_now, 1);
-					(void)i2c_write_registers(0x50, &probe_old, 1);
-					stuck = probe_now == five_a;
-					printf("umi_touch: sweep %#04x r16=%u nr=%u st=%u: boot %02x %02x id %02x %02x"
-					    " 86=%02x a6=%02x a8=%02x fa=%02x write %s\n",
-					    addresses[a], r16, nr, st, boot[0], boot[1], idh, idl,
-					    r86, ra6, ra8, rfa, stuck ? "STUCK" : "ignored");
-					interesting = stuck || idh != 0x00 || idl != 0x00 ||
-					    (boot[0] != 0x00 && boot[0] != 0xff);
-					if (interesting) {
-						printf("umi_touch: that one is worth the map://n");
-						register_dump();
-					}
-				}
-			}
+			(void)fts_read_registers(variant[v].id, with_dummy, 2);
+			(void)fts_read_registers(variant[v].fw, fw, 2);
+			printf("umi_touch: sweep %#04x %s: id %02x %02x fw %02x %02x%s\n",
+			    addresses[a], variant[v].name, with_dummy[0], with_dummy[1], fw[0], fw[1],
+			    (with_dummy[0] == FTS_ID_0_A && with_dummy[1] == FTS_ID_1_A) ||
+			    (with_dummy[0] == FTS_ID_0_B && with_dummy[1] == FTS_ID_1_B) ?
+			    "  <-- that is this part" : "");
 		}
 	}
+	bus_address = I2C_ADDRESS;
 }
 
 static void
 poll_report(void)
 {
-	static uint8_t report[FTS_REPORT_LENGTH];
-	static unsigned bad, shown_raw;
+	static uint8_t event[FTS_EVENT_SIZE];
+	static unsigned shown_raw;
 
 	seen.polls++;
-	if (!i2c_read_registers((uint8_t)touch_register, report, sizeof(report))) {
-		seen.bad++;
-		if (bad++ < 8) {
-			printf("umi_touch: reading register %#x failed\n", touch_register);
+	/*
+	 * Drain the FIFO: the chip queues one event per finger per change, up to FIFO_DEPTH of them,
+	 * and 0x00 means empty. Reading exactly one event per look and stopping there was what the
+	 * FocalTech snapshot report wanted; here it would leave a queue behind and the touch would
+	 * lag further behind the finger with every look.
+	 */
+	for (unsigned i = 0; i < FTS_FIFO_DEPTH; i++) {
+		if (!fts_read_event(event)) {
+			seen.bad++;
+			return;
 		}
-		return;
+		if (event[0] == EVENTID_NO_EVENT) {
+			return;
+		}
+		if (shown_raw < 8) {
+			shown_raw++;
+			printf("umi_touch: event %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			    event[0], event[1], event[2], event[3],
+			    event[4], event[5], event[6], event[7]);
+		}
+		switch (event[0]) {
+		case EVENTID_ENTER_POINTER:
+		case EVENTID_MOTION_POINTER:
+		case EVENTID_LEAVE_POINTER:
+			parse_event(event);
+			break;
+		default:
+			break;          /* status, errors and the rest are not needed to move a cursor */
+		}
 	}
-	if (shown_raw < 4) {
-		shown_raw++;
-		printf("umi_touch: report at %#x: %02x %02x %02x %02x %02x %02x %02x %02x "
-		    "%02x %02x %02x %02x %02x %02x %02x %02x ...\n", touch_register,
-		    report[0], report[1], report[2], report[3], report[4], report[5], report[6], report[7],
-		    report[8], report[9], report[10], report[11], report[12], report[13], report[14], report[15]);
-	}
-	seen.reports++;
-	parse_report(report);
 }
 
 /* ---- what RPMh can switch (dt: reserved-memory cmd_db@80860000) ---------------------------------- */
@@ -1206,7 +1282,7 @@ bus_supply_on(void)
 static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
-	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, reg = 0, one = 0, pp = 0, cd = 0;
+	uint32_t poll_us = 8000, diag = 0, avdd = 0, swap = 0, one = 0, pp = 0, cd = 0;
 	uint32_t sc = 0;
 	uint32_t sup = 0;
 	uint32_t df = 0;
@@ -1219,7 +1295,6 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_diag", &diag, sizeof(diag));
 	PE_parse_boot_argn("umi_touch_avdd", &avdd, sizeof(avdd));
 	PE_parse_boot_argn("umi_touch_swap", &swap, sizeof(swap));
-	PE_parse_boot_argn("umi_touch_reg", &reg, sizeof(reg));
 	PE_parse_boot_argn("umi_touch_flip", &flip, sizeof(flip));
 	PE_parse_boot_argn("umi_touch_stage", &stage, sizeof(stage));
 	PE_parse_boot_argn("umi_touch_gpio", &one, sizeof(one));
@@ -1232,22 +1307,10 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	PE_parse_boot_argn("umi_touch_scan", &sc, sizeof(sc));
 	PE_parse_boot_argn("umi_touch_supply", &sup, sizeof(sup));
-	{
-		uint32_t start = 1;
-
-		PE_parse_boot_argn("umi_touch_start", &start, sizeof(start));
-		start_chip = start != 0;
-	}
 	PE_parse_boot_argn("umi_touch_diff", &df, sizeof(df));
 	PE_parse_boot_argn("umi_touch_wtest", &wt, sizeof(wt));
 	PE_parse_boot_argn("umi_touch_settle_ms", &settle_ms, sizeof(settle_ms));
 	PE_parse_boot_argn("umi_touch_sweep", &sw, sizeof(sw));
-	{
-		uint32_t r16 = 0;
-
-		PE_parse_boot_argn("umi_touch_reg16", &r16, sizeof(r16));
-		reg16 = r16 != 0;
-	}
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
@@ -1255,9 +1318,6 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	if (poll_us < 250 || poll_us > 100000) {
 		poll_us = 8000;
-	}
-	if (reg) {
-		touch_register = reg;
 	}
 
 	tlmm_west = ml_io_map(TLMM_WEST, TLMM_SIZE);
@@ -1374,7 +1434,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		return;
 	}
 	if (!found) {
-		printf("umi_touch: no FocalTech touch screen on I2C %#x\n", I2C_ADDRESS);
+		printf("umi_touch: no FingerTipS touch screen on I2C %#x\n", I2C_ADDRESS);
 		show_pins("no answer");
 		thread_terminate(current_thread());
 		return;
@@ -1383,8 +1443,24 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	if (diag) {
 		register_dump();
 	}
-	printf("umi_touch: FocalTech touch screen ready; the interrupt line is looked at every %u us, "
-	    "the report is read from register %#x\n", poll_us, touch_register);
+	/*
+	 * A chip that has just been reset is not scanning the panel and is not driving its interrupt
+	 * line, so neither the FIFO nor gpio39 would ever say anything. The vendor driver does the
+	 * same two things when it resumes (fts.c: fts_command(FTS_CMD_MS_MT_SENSE_ON) and a write of
+	 * IER_ENABLE to IER_ADDR); without them the loop below would poll an idle part forever and
+	 * look exactly like a driver that cannot read the chip.
+	 */
+	{
+		uint8_t ier = FTS_IER_ENABLE;
+		bool sense_ok = fts_command(FTS_CMD_SENSE_ON);
+		bool ier_ok = fts_write_registers(FTS_IER_ADDR, &ier, 1);
+
+		printf("umi_touch: sense on: %s; interrupt enable: %s\n",
+		    sense_ok ? "acked" : "not acked", ier_ok ? "acked" : "not acked");
+		sleep_ms(20);
+	}
+	printf("umi_touch: FingerTipS touch screen ready; the interrupt line is looked at every %u us, "
+	    "events are read with command %#x\n", poll_us, FTS_CMD_READ_ONE);
 
 	for (unsigned tick = 1;; tick++) {
 		if (!gpio_get(PIN_INT)) {
