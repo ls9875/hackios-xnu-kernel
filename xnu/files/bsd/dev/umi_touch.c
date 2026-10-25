@@ -55,13 +55,15 @@
  *   umi_touch_cmd_db=1  print what RPMh can switch, with the address of each, and stop
  *   umi_touch_scan=1    ask every address on the bus who is there, before anything else, and stop
  *   umi_touch_supply=1  put the board back the way Android leaves it before touching the bus:
- *                       smpa4 on (undoing an earlier pcycle run), then ldoc1 on -- the 1.8 V this
- *                       pair's pull-ups hang from, proved by run 152817 -- then gpio69, the
- *                       switch in front of it, then a reset pulse
+ *                       smpa4 on (undoing an earlier pcycle run), ldoc1 on -- the 1.8 V this
+ *                       pair's pull-ups hang from, proved by run 152817 -- gpio69, the switch
+ *                       the fts node names, then the three rails below the display tree
+ *                       (gpio5 vdd_boost_vreg, gpio71 display_panel_vci, gpio12 ext_5v_boost),
+ *                       then a reset pulse, reading the chip id after each step
  *   umi_touch_proto=1   the chip acknowledges its address and returns zero for every register:
  *                       read the ID through sixteen opcodes, dump the whole 256-byte map, and
  *                       write/read-back sixteen addresses, to tell a wrong opcode from a core
- *                       that is not running. Stops after.
+ *                       that is not running. Powers up first and stops after.
  *   umi_touch_pcycle=1  switch smpa4 off and back on with the reset held low, then send the
  *                       rom's warm boot: the only thing that clears state a previous run left
  *                       behind, because `fastboot boot` never power-cycles the SoC. Stops after.
@@ -115,8 +117,9 @@ extern kern_return_t thread_terminate(thread_t thread);
  * nothing on the wire. The POCO X5 Pro that driver was written for (yupik) has one tile at
  * 0x0f100000 and never meets this.
  *
- * All five pins this driver uses -- 36, 37, 38, 39 and 69 -- are in TLMM_SOUTH:
- * gpio36 at 0x0f524000, gpio39 at 0x0f527000, gpio69 at 0x0f545000.
+ * All five pins the bus and the chip itself use -- 36, 37, 38, 39 and 69 -- are in TLMM_SOUTH:
+ * gpio36 at 0x0f524000, gpio39 at 0x0f527000, gpio69 at 0x0f545000. The two rails below the
+ * display tree are not: gpio5 and gpio12 are in TLMM_NORTH, gpio71 is in TLMM_SOUTH again.
  */
 #define TLMM_WEST                0x0f100000UL
 #define TLMM_SOUTH               0x0f500000UL
@@ -133,7 +136,26 @@ extern kern_return_t thread_terminate(thread_t thread);
 #define PIN_SCL                  37      /* qupv3_se13_i2c_active: "qup13" */
 #define PIN_RESET                38      /* fts,reset-gpio; low = in reset */
 #define PIN_INT                  39      /* fts,irq-gpio; low = the chip has a report */
-#define PIN_AVDD                 69      /* disp_vddio_vreg's enable, active high */
+#define PIN_AVDD                 69      /* touch_vddio_vreg ("disp_vddio_vreg"), active high */
+/*
+ * The other three rails in the same fragment of the panel overlay. touch_vddio_vreg is the one the
+ * fts node names -- avdd-supply points at it -- but a part that acknowledges its address and
+ * returns zero for all 256 registers, refuses writes and ignores sense-on is a part whose i/o ring
+ * is powered and whose core is not, and the i/o ring is not the only thing on this board that has
+ * to be switched on. All three of these are in /fragment@76 of fts-entry.dtb:
+ *
+ *   vdd_boost_vreg       gpio5    regulator-always-on, 4 ms startup delay
+ *   display_panel_vci    gpio71   3.0 V, regulator-boot-on
+ *   ext_5v_boost         gpio12   5 V, regulator-enable-ramp-delay 1600
+ *
+ * "always-on" is the one that matters: Linux enables a regulator-always-on node when it registers
+ * it, without anything asking for it, so Android has had gpio5 high since boot and this kernel
+ * never has. A touch asic's avdd is typically 2.8-3.3 V and comes off the display's power tree,
+ * which is what these three are.
+ */
+#define PIN_VBOOST               5       /* vdd_boost_vreg */
+#define PIN_V5                   12      /* ext_5v_boost */
+#define PIN_VCI                  71      /* display_panel_vci */
 
 #define I2C_ADDRESS              0x49    /* fts@49 */
 
@@ -1791,6 +1813,106 @@ panel_supply_off(const char *name)
 	return rpmh_write(address, data, 1);
 }
 
+/*
+ * Read the id and say what it means, for the line the caller is about to print.
+ */
+static void
+power_id(const char *when)
+{
+	uint8_t id[2] = { 0, 0 };
+
+	if (!fts_read_registers(FTS_CHIP_ID_ADDR_A, id, 2)) {
+		printf("umi_touch: power: %-28s not acknowledged\n", when);
+		return;
+	}
+	printf("umi_touch: power: %-28s id %02x %02x%s\n", when, id[0], id[1],
+	    (id[0] == FTS_ID_0_A && id[1] == FTS_ID_1_A) ? "   <- 36 70, the core is running"
+	    : (id[0] == FTS_ID_0_B && id[1] == FTS_ID_1_B) ? "   <- 39 6c, the core is running"
+	    : (id[0] || id[1]) ? "   <- something, and it is not zero"
+	    : "");
+}
+
+/*
+ * Power the part up the way Android has it, in the order the hardware wants, and read the id after
+ * every step so that a run which fails still says which rail was the one.
+ *
+ * What is known and what is guessed, because the difference matters when reading the log:
+ *
+ *   ldoc1 (pm8150a_l1)   known. Run 152817 asked RPMh for this rail and nothing else and sda, scl
+ *                        and reset went from reading 0 to reading 1 with no pad touched. It is
+ *                        fixed at 1.8 V (min = max = init = 1800000 in the base tree) and the
+ *                        pair's pull-ups hang from it. With it off, both lines sit at about 0.6 V
+ *                        through the chip's esd diodes and every read returns zeros with what
+ *                        looks like an acknowledge on every byte -- a line held low *is* one.
+ *   gpio69               known to be the switch the fts node names (avdd-supply -> touch_vddio_vreg),
+ *                        not known to be enough: with it high and ldoc1 on, the part acknowledges
+ *                        its address, and 0x48 does not, so the acknowledge is real; and all 256
+ *                        registers still read zero, writes do not stick, and sense-on does nothing.
+ *   gpio5, gpio71        the guess, and the reason this function exists. See PIN_VBOOST.
+ *
+ * The reset pulse comes last, after every rail: a part held in reset while its supplies come up is
+ * a part that comes up in an undefined state.
+ */
+static void
+power_up(void)
+{
+	static const struct {
+		unsigned pin;
+		const char *what;
+		unsigned wait_ms;
+	} rails[] = {
+		{ PIN_VBOOST, "gpio5, vdd_boost_vreg", 6 },     /* startup-delay-us 4000 */
+		{ PIN_VCI,    "gpio71, display_panel_vci", 2 }, /* 3.0 V, boot-on */
+	};
+	/*
+	 * ext_5v_boost (gpio12) is deliberately not driven. It is the third rail in the same fragment
+	 * and it is the only other candidate, but the base tree gives it to qcom,usb-pdphy as
+	 * vbus-supply: it is the otg 5 V, and switching it on while this kernel is talking to the
+	 * loader over that same usb port is a good way to lose the log that says what happened. If the
+	 * two below are not it, that one is next, with the run's output already captured.
+	 */
+
+	line_release(pin_sda);
+	line_release(pin_scl);
+	sleep_ms(2);
+	printf("umi_touch: power: as found: sda %u scl %u reset %u int %u\n",
+	    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_RESET), gpio_get(PIN_INT));
+
+	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	printf("umi_touch: power: smpa4 back on (an earlier run turned it off): %s\n",
+	    panel_supply_on("smpa4") ? "done" : "refused");
+	sleep_ms(10);
+	printf("umi_touch: power: ldoc1 (pm8150a_l1, 1.8 V): %s\n",
+	    bus_supply_on() ? "done" : "refused");
+	sleep_ms(20);
+	printf("umi_touch: power: with ldoc1 on: sda %u scl %u reset %u int %u\n",
+	    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_RESET), gpio_get(PIN_INT));
+
+	printf("umi_touch: power: gpio%u touch_vddio_vreg %#x/%u -> high\n", PIN_AVDD,
+	    rd(GPIO_CFG(PIN_AVDD)), gpio_get(PIN_AVDD));
+	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
+	sleep_ms(5);
+	power_id("vddio switch on");
+
+	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
+		printf("umi_touch: power: %s %#x/%u -> high\n", rails[i].what,
+		    rd(GPIO_CFG(rails[i].pin)), gpio_get(rails[i].pin));
+		gpio_output(rails[i].pin, true, PULL_NONE, 2);
+		sleep_ms(rails[i].wait_ms);
+		printf("umi_touch: power: %s is now %#x/%u\n", rails[i].what,
+		    rd(GPIO_CFG(rails[i].pin)), gpio_get(rails[i].pin));
+		power_id(rails[i].what);
+	}
+
+	gpio_output(PIN_RESET, false, PULL_NONE, 2);
+	sleep_ms(20);
+	gpio_output(PIN_RESET, true, PULL_NONE, 2);
+	sleep_ms(settle_ms);
+	printf("umi_touch: power: out of reset: sda %u scl %u reset %u int %u\n",
+	    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_RESET), gpio_get(PIN_INT));
+	power_id("out of reset");
+}
+
 static void
 umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -1852,55 +1974,21 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	show_pins("as found");
 	/*
 	 * umi_touch_supply=1: put the board back the way Android leaves it, in the order the hardware
-	 * wants, before anything is measured.
-	 *
-	 * ldoc1 (pm8150a_l1) is the rail this pair and the part's I/O ring hang from, and that is not
-	 * a guess any more: run 152817 asked RPMh for that one rail and nothing else, and sda, scl and
-	 * reset went from reading 0 to reading 1 without a single pin being touched. It is also why
-	 * every run since has opened with the bus clamped -- the rail is off after a `fastboot boot`,
-	 * the chip's esd diodes hold both lines at about 0.6 V, and every read then returns zeros with
-	 * what looks like an acknowledge on every byte, because a line held low *is* an acknowledge.
-	 *
-	 * smpa4 (pm8150_s4) is not the part's supply -- the overlay's avdd-supply is a local phandle
-	 * to touch_vddio_vreg, the gpio69 switch, and pm8150_s4 in the base tree is Wi-Fi's
-	 * vdd-wlan-io-supply. It is asked for here anyway, and that is not a leftover: run 214827
-	 * turned it off with umi_touch_pcycle=3 and the bus has been clamped in every run since,
-	 * across reboots, because `fastboot boot` does not power-cycle the SoC. Turning it back on is
-	 * how that is undone. It stays at its normal 1.8 V either way.
-	 *
-	 * gpio69 (touch_vddio_vreg, "disp_vddio_vreg") is the switch in front of ldoc1, and only then
-	 * does the part get a reset pulse.
+	 * wants, before anything is measured. power_up() is the whole of it and says what is known and
+	 * what is guessed, rail by rail; the short version is that ldoc1 is the 1.8 V this pair hangs
+	 * from and gpio69 the switch the fts node names, and the part still does not run on those two
+	 * alone, which is why the three rails below the display tree are tried as well.
 	 */
-	if (sup) {
-		rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
-		printf("umi_touch: putting smpa4 back (a previous run turned it off): %s\n",
-		    panel_supply_on("smpa4") ? "done" : "refused or timed out");
-		sleep_ms(10);
-		printf("umi_touch: ldoc1, the 1.8 V this pair hangs from: %s\n",
-		    bus_supply_on() ? "done" : "refused or timed out");
-		sleep_ms(20);
-		show_pins("with ldoc1 on");
-		printf("umi_touch: gpio%u, the switch in front of it: %#x/%u, driving it high\n",
-		    PIN_AVDD, rd(GPIO_CFG(PIN_AVDD)), gpio_get(PIN_AVDD));
-		gpio_output(PIN_AVDD, true, PULL_NONE, 2);
-		sleep_ms(20);
-		show_pins("with the switch on");
-		gpio_output(PIN_RESET, false, PULL_NONE, 2);
-		sleep_ms(20);
-		gpio_output(PIN_RESET, true, PULL_NONE, 2);
-		sleep_ms(settle_ms);
-		show_pins("out of reset");
+	if (sup || proto) {
+		power_up();
 	}
 	/*
 	 * umi_touch_proto=1: the chip acknowledges its address and returns zero for every register.
 	 * This is the run that decides whether that is a wrong opcode or a core that is not running;
-	 * see protocol_scan(). The pins are set up and the chip is taken out of reset first, because
-	 * pins_for_i2c() holds reset low on purpose.
+	 * see protocol_scan(). power_up() has just left the chip out of reset with every rail up,
+	 * which is the state the scan needs -- pins_for_i2c() would put reset back down.
 	 */
 	if (proto) {
-		pins_for_i2c();
-		gpio_output(PIN_RESET, true, PULL_NONE, 2);
-		sleep_ms(settle_ms);
 		i2c_bus_recover();
 		printf("umi_touch: the pair before the scan: sda %u scl %u int %u\n",
 		    gpio_get(pin_sda), gpio_get(pin_scl), gpio_get(PIN_INT));
