@@ -318,11 +318,29 @@ i2c_delay(void)
 	sleep_us(bit_us);
 }
 
+/*
+ * Let SCL go and wait until it is really high. A slave is allowed to hold SCL down until it has
+ * the byte ready -- clock stretching -- and this driver used to read through that: it released
+ * the line, waited three microseconds and sampled SDA whether or not SCL had actually risen.
+ * Writing the address byte survives that, because the slave has nothing to prepare; reading a
+ * register does not, and a chip that stretches answers every read with zeros, which is exactly
+ * the map this one gave: four non-zero bytes out of 256, unchanged at 5 kHz, on a bus that
+ * acknowledges its address perfectly well.
+ */
+static void
+scl_high(void)
+{
+	scl_high();
+	for (int i = 0; i < 4000 && !gpio_get(pin_scl); i++) {
+		sleep_us(1);            /* the slave is holding it down; give it the time it is asking for */
+	}
+}
+
 static void
 i2c_start(void)
 {
 	line_release(pin_sda);
-	line_release(pin_scl);
+	scl_high();
 	i2c_delay();
 	line_low(pin_sda);              /* SDA falls while SCL is high */
 	i2c_delay();
@@ -335,7 +353,7 @@ i2c_stop(void)
 {
 	line_low(pin_sda);
 	i2c_delay();
-	line_release(pin_scl);          /* SCL rises */
+	scl_high();          /* SCL rises */
 	i2c_delay();
 	line_release(pin_sda);          /* SDA rises while SCL is high */
 	i2c_delay();
@@ -351,7 +369,7 @@ i2c_write_byte(uint8_t value)
 			line_low(pin_sda);
 		}
 		i2c_delay();
-		line_release(pin_scl);
+		scl_high();
 		i2c_delay();
 		line_low(pin_scl);
 		i2c_delay();
@@ -359,7 +377,7 @@ i2c_write_byte(uint8_t value)
 	/* the acknowledge: the chip holds SDA down for one clock */
 	line_release(pin_sda);
 	i2c_delay();
-	line_release(pin_scl);
+	scl_high();
 	i2c_delay();
 	bool ack = !gpio_get(pin_sda);
 	line_low(pin_scl);
@@ -375,7 +393,7 @@ i2c_read_byte(bool ack)
 	line_release(pin_sda);
 	for (int bit = 7; bit >= 0; bit--) {
 		i2c_delay();
-		line_release(pin_scl);
+		scl_high();
 		i2c_delay();
 		value = (uint8_t)(value << 1 | (gpio_get(pin_sda) ? 1 : 0));
 		line_low(pin_scl);
@@ -386,7 +404,7 @@ i2c_read_byte(bool ack)
 		line_low(pin_sda);
 	}
 	i2c_delay();
-	line_release(pin_scl);
+	scl_high();
 	i2c_delay();
 	line_low(pin_scl);
 	line_release(pin_sda);
@@ -613,7 +631,7 @@ static void
 pins_for_i2c(void)
 {
 	line_release(pin_sda);
-	line_release(pin_scl);
+	scl_high();
 	gpio_output(PIN_RESET, false, PULL_UP, 8);      /* held in reset until the chip is asked for */
 	gpio_configure(PIN_INT, 0, PULL_UP, 8, false);
 }
