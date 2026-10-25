@@ -79,11 +79,15 @@ fb() { flock -w 90 $PHONE.lock timeout "${FB_TIMEOUT:-10}" fastboot "$@" 2>&1; }
 # does the loader answer while its kernel runs (0.5 and later)? an older one answers only when the run is over
 live_loader() { fb getvar version | grep -Eq 'version: 0\.([5-9]|[1-9][0-9])'; }
 in_fastboot() { fastboot devices 2>/dev/null | grep -q fastboot; }
+# `adb get-state` answers for "the" device and refuses when more than one is attached, which one
+# stale `emulator-5554 offline` entry from an earlier session does -- and then a phone sitting in
+# Android looks absent to every command that asks. Ask for a serial instead.
+in_android() { adb devices 2>/dev/null | awk '$2 == "device" && $1 !~ /^emulator-/ { found = 1 } END { exit !found }'; }
 is_loader() { in_fastboot && fb getvar product | grep -q 'product: xnuloader'; }
 state() {
 	if is_loader; then echo loader
 	elif in_fastboot; then echo fastboot
-	elif [ "$(adb get-state 2>/dev/null)" = device ]; then echo android
+	elif in_android; then echo android
 	else echo absent; fi
 }
 wait_for() { # wait_for <state> <seconds>

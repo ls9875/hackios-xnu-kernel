@@ -53,6 +53,7 @@
  *   umi_touch_supply=1  ask RPMh for pm8150a_l1 (ldoc1, 1.8 V) before touching the bus
  *   umi_touch_start=0   do not run the 0x55/0xAA start sequence before reading the chip ID
  *   umi_touch_diff=1    read the whole map three times and print only what changes between
+ *   umi_touch_wtest=1   write a byte to three registers and read it back, then stop
  *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
  *                       low, 2 does not touch it -- one of the three is the chip out of reset
  *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
@@ -849,6 +850,34 @@ register_diff(void)
 	}
 }
 
+/*
+ * Do writes stick? Reading tells us what the chip says about itself; writing a byte and reading it
+ * back tells us whether anything behind the I2C slave is alive at all. A part that acknowledges its
+ * address, answers 0 for 252 of its 256 registers and ignores a write has its bus interface up and
+ * nothing behind it -- which is what a controller that has not been given its application firmware
+ * looks like. Each register is put back the way it was found.
+ */
+static void
+write_test(void)
+{
+	static const uint8_t where[3] = { 0x50, 0xa5, 0x20 };
+
+	for (unsigned i = 0; i < sizeof(where); i++) {
+		uint8_t old = 0xff, now = 0xff, back = 0xff, five_a = 0x5a;
+		bool old_ok, wrote;
+
+		old_ok = i2c_read_registers(where[i], &old, 1);
+		wrote = i2c_write_registers(where[i], &five_a, 1);
+		(void)i2c_read_registers(where[i], &now, 1);
+		if (old_ok) {
+			(void)i2c_write_registers(where[i], &old, 1);
+			(void)i2c_read_registers(where[i], &back, 1);
+		}
+		printf("umi_touch: %#04x: read %02x; write 5a %s; reads %02x; put back %02x\n",
+		    where[i], old, wrote ? "acked" : "not acked", now, back);
+	}
+}
+
 static void
 poll_report(void)
 {
@@ -1091,6 +1120,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	uint32_t sc = 0;
 	uint32_t sup = 0;
 	uint32_t df = 0;
+	uint32_t wt = 0;
 	unsigned idle = 0, idle_looks;
 	bool found = false;
 
@@ -1118,6 +1148,7 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 		start_chip = start != 0;
 	}
 	PE_parse_boot_argn("umi_touch_diff", &df, sizeof(df));
+	PE_parse_boot_argn("umi_touch_wtest", &wt, sizeof(wt));
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
@@ -1191,6 +1222,15 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	}
 	idle_looks = 80000 / poll_us;    /* a read every 80 ms even with the line high, in case it is missed */
 
+	if (wt) {
+		pins_for_i2c();
+		gpio_set(PIN_RESET, reset_mode != 0);
+		sleep_ms(200);
+		printf("umi_touch: does a write stick?\n");
+		write_test();
+		thread_terminate(current_thread());
+		return;
+	}
 	if (df) {
 		pins_for_i2c();
 		gpio_set(PIN_RESET, reset_mode != 0);
