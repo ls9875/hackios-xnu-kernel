@@ -55,6 +55,7 @@
  *   umi_touch_diff=1    read the whole map three times and print only what changes between
  *   umi_touch_wtest=1   write a byte to three registers and read it back, then stop
  *   umi_touch_settle_ms=N  how long the chip gets between the reset and the first read (200)
+ *   umi_touch_reg16=1   send a two-byte register address instead of one
  *   umi_touch_reset=N   1 (the default) leaves the reset line high after the pulse, 0 leaves it
  *                       low, 2 does not touch it -- one of the three is the chip out of reset
  *   umi_touch_bit_us=N  a half clock in microseconds (3 by default, about 150 kHz)
@@ -284,6 +285,16 @@ static uint32_t bit_us = 3;         /* a half clock; about 150 kHz with 3 */
  * driving that pair and the chip has no supply.
  */
 static bool pushpull;
+/*
+ * umi_touch_reg16=1 sends two address bytes, 0x00 and then the register, instead of one.
+ *
+ * It is here because of what this chip does with one: the address byte is acknowledged, the
+ * register byte is acknowledged, the data comes back 0x00, and a write into any register is
+ * acknowledged and does not stick. That is also exactly what a part expecting a 16-bit register
+ * address would do when handed eight -- consume the register byte as its high half, wait for a
+ * low half that never comes, and answer nothing. One boot argument tells the two apart.
+ */
+static bool reg16;
 
 /*
  * Where the bring-up is, one line per step. A run that stops leaves its last line behind, so
@@ -489,7 +500,8 @@ i2c_read_registers(uint8_t reg, uint8_t *data, uint32_t length)
 	bool ok = false;
 
 	i2c_start();
-	if (i2c_write_byte(I2C_ADDRESS << 1) && i2c_write_byte(reg)) {
+	if (i2c_write_byte(I2C_ADDRESS << 1) && (reg16 ? i2c_write_byte(0x00) : true) &&
+	    i2c_write_byte(reg)) {
 		i2c_start();                                   /* repeated start */
 		if (i2c_write_byte(I2C_ADDRESS << 1 | 1)) {
 			for (uint32_t i = 0; i < length; i++) {
@@ -508,7 +520,8 @@ i2c_write_registers(uint8_t reg, const uint8_t *data, uint32_t length)
 	bool ok;
 
 	i2c_start();
-	ok = i2c_write_byte(I2C_ADDRESS << 1) && i2c_write_byte(reg);
+	ok = i2c_write_byte(I2C_ADDRESS << 1) && (reg16 ? i2c_write_byte(0x00) : true) &&
+	    i2c_write_byte(reg);
 	for (uint32_t i = 0; ok && i < length; i++) {
 		ok = i2c_write_byte(data[i]);
 	}
@@ -1152,6 +1165,12 @@ umi_touch_thread(__unused void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("umi_touch_diff", &df, sizeof(df));
 	PE_parse_boot_argn("umi_touch_wtest", &wt, sizeof(wt));
 	PE_parse_boot_argn("umi_touch_settle_ms", &settle_ms, sizeof(settle_ms));
+	{
+		uint32_t r16 = 0;
+
+		PE_parse_boot_argn("umi_touch_reg16", &r16, sizeof(r16));
+		reg16 = r16 != 0;
+	}
 	if (PE_parse_boot_argn("umi_touch_cmd_db", &cd, sizeof(cd)) && cd) {
 		dump_cmd_db();
 		thread_terminate(current_thread());
