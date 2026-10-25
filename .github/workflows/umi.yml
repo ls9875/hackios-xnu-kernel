@@ -159,14 +159,34 @@ jobs:
         run: |
           # pipefail: a failed build must not look green because tee was the last command
           set -o pipefail
-          ./xnu-build.sh -j"$(nproc)" -k 2>&1 | tee kernel-build.log
+          # -k is make's own keep-going, not a target. It is needed because
+          # config/Makefile's check_all_exports cannot pass for any kernel build: it feeds
+          # kextsymboltool the kernel's symbols and asks for every name in
+          # config/<KPI>.exports to be among them, and 222 of those names -- the
+          # "..._Invoke"/"..._Dispatch" OSDispatch trampolines of IOService, IOUserClient,
+          # OSAction and friends -- are DriverKit symbols that appear nowhere in the XNU
+          # sources (grep for "_Invoke" under iokit/ and libkern/: nothing). The kernel this
+          # port already ships in prebuilt/ has 1213 IOService symbols and not one of them,
+          # so the check would have failed on that build too. The kernel is linked before the
+          # check runs, so make's exit status says nothing about it: what is checked below is
+          # XNU's own "built kernel at" line, and the driver being in the binary.
+          ./xnu-build.sh -j"$(nproc)" -k 2>&1 | tee kernel-build.log || true
+          grep -q "built kernel at" kernel-build.log \
+            || { echo "::error::no kernel was built"; tail -80 kernel-build.log; exit 1; }
           K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
-          [ -s "$K" ] || { echo "::error::no kernel was built"; tail -80 kernel-build.log; exit 1; }
+          [ -s "$K" ] || { echo "::error::$K is missing"; exit 1; }
           echo "kernel $(stat -c %s $K) bytes"
           # the port's drivers have to be in it: a build that silently dropped one would still
-          # boot, just without the touch screen
-          nm "$K" 2>/dev/null | grep -q -w umi_touch_init \
-            || { echo "::error::umi_touch_init is not in the kernel"; exit 1; }
+          # boot, just without the touch screen. cctools' nm reads Mach-O; the distribution's
+          # does not, which is why this is host/bin/nm and not plain nm -- with the string
+          # table as the fallback, in case that link is missing.
+          if xnu-deps/host/bin/nm "$K" 2>/dev/null | grep -q -w umi_touch_init; then
+            echo "umi_touch_init is in the kernel"
+          elif grep -qa _umi_touch_init "$K"; then
+            echo "umi_touch_init is in the kernel (string table; nm was not usable)"
+          else
+            echo "::error::umi_touch_init is not in the kernel"; exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
